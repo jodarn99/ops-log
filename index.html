@@ -4502,8 +4502,10 @@ function saveGoogle() {
 // Open Google's sign-in pop-up and get a token.
 function googleSignIn() {
   return new Promise((resolve, reject) => {
-    // Opened from a home-screen icon on iPhone: pop-ups never work there.
-    if (navigator.standalone) return googleRedirectSignIn();
+    // iPhone and iPad: Google's pop-up is unreliable there (blocked pop-ups,
+    // home-screen apps), so always use the full-page sign-in instead.
+    const apple = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    if (apple || navigator.standalone) return googleRedirectSignIn();
     if (!window.google?.accounts?.oauth2) return reject(new Error("Google's sign-in script hasn't loaded. Are you online?"));
     if (!settings.google.clientId) return reject(new Error("Paste your OAuth client ID first."));
     // A client ID always ends in .apps.googleusercontent.com. Catch a wrong
@@ -4522,7 +4524,7 @@ function googleSignIn() {
       error_callback: (problem) => {
         // iPhones often block Google's pop-up (home-screen apps, in-app
         // browsers, Safari's "Block Pop-ups"). Then sign in on a full page instead.
-        if (problem.type === "popup_failed_to_open") return googleRedirectSignIn();
+        if (problem.type === "popup_failed_to_open" || /popup/i.test(problem.message || "")) return googleRedirectSignIn();
         reject(new Error(problem.message || problem.type));
       },
     });
