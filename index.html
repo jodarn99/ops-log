@@ -4726,6 +4726,9 @@ function dayFromSerial(serial) {
   return new Date(Date.UTC(1899, 11, 30) + serial * 86400000).toISOString().slice(0, 10);
 }
 
+// Where each AAR answer goes on a month tab: the answer box in column C.
+const AAR_SHEET_ROWS = { planned: 39, happened: 42, why: 45, sustain: 48, improve: 51, orders: 54 };
+
 // Column number -> letters: 0 = A, 25 = Z, 26 = AA, 32 = AG.
 function columnName(c) {
   return c < 26 ? String.fromCharCode(65 + c) : String.fromCharCode(64 + Math.floor(c / 26)) + String.fromCharCode(65 + (c % 26));
@@ -4746,14 +4749,16 @@ async function syncToSheet() {
   const info = await googleFetch(`${sheet}?fields=sheets.properties.title`);
   const tabs = new Set(info.sheets.map((s) => s.properties.title));
   if (!tabs.has("HQ")) throw new Error("That spreadsheet has no HQ tab. Is it your Habit Tracker?");
-  const months = [];
+  const months = [];      // tab names, like "OCT 2026"
+  const monthKeys = [];   // the same months as the app names them, like "2026-10"
   for (let day = TRACK_START; day <= todayKey(); day = addDays(day, 1)) {
     const tab = tabFor(day);
-    if (tabs.has(tab) && !months.includes(tab)) months.push(tab);
+    if (tabs.has(tab) && !months.includes(tab)) { months.push(tab); monthKeys.push(day.slice(0, 7)); }
   }
 
   // 2. Read the HQ roster and every month's grid in one trip.
-  const ranges = [quote("HQ", "L9:M40"), ...months.map((tab) => quote(tab, "A1:AK33"))];
+  // (Rows 1–33 are the habit grids; rows 39–55 are the AAR answer boxes.)
+  const ranges = [quote("HQ", "L9:M40"), ...months.map((tab) => quote(tab, "A1:AK57"))];
   const read = await googleFetch(`${sheet}/values:batchGet?valueRenderOption=UNFORMATTED_VALUE&` +
     ranges.map((r) => "ranges=" + encodeURIComponent(r)).join("&"));
   const [roster, ...grids] = read.valueRanges.map((v) => v.values || []);
@@ -4791,11 +4796,43 @@ async function syncToSheet() {
     });
   });
 
+  // 4b. Your monthly AAR answers go in the AFTER ACTION REVIEW boxes on
+  //     each month tab (column C, one box per question). Only answers you've
+  //     written are sent, so nothing typed in the sheet gets blanked.
+  grids.forEach((grid, i) => {
+    const answers = reviews[`month:${monthKeys[i]}`] || {};
+    for (const [id, row] of Object.entries(AAR_SHEET_ROWS)) {
+      const text = (answers[id] || "").trim();
+      const inSheet = String((grid[row - 1] || [])[2] ?? "").trim();
+      if (text && text !== inSheet) changes.push({ range: quote(months[i], `C${row}`), value: text, clears: false });
+    }
+  });
+
   // 5. Marks in the sheet that the app doesn't have: ask before erasing them.
   const clears = changes.filter((ch) => ch.clears).length;
   let toWrite = changes;
   if (clears && !confirm(`Your sheet has ${clears} check-off${clears === 1 ? "" : "s"} the app doesn't.\n\nOK = erase them so the sheet matches the app.\nCancel = keep them and only add the app's check-offs.`)) {
     toWrite = changes.filter((ch) => !ch.clears);
+  }
+  // 5b. Weekly Debriefs: the sheet has no place for them, so they get their
+  //     own DEBRIEFS tab (made on the first sync). One row per week you filed.
+  //     The app owns this tab: it's rewritten in full each sync.
+  const debriefRows = [["WEEK OF", "WHAT WENT WELL", "WHAT GOT IN THE WAY", "ADJUSTMENT FOR NEXT WEEK"]];
+  for (const key of Object.keys(reviews).filter((k) => k.startsWith("week:") && isFiled(k)).sort()) {
+    const a = reviews[key];
+    debriefRows.push([key.slice(5), a.wins || "", a.friction || "", a.adjust || ""]);
+  }
+  if (debriefRows.length > 1) {
+    if (!tabs.has("DEBRIEFS")) {
+      await googleFetch(`${sheet}:batchUpdate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requests: [{ addSheet: { properties: { title: "DEBRIEFS" } } }] }),
+      });
+    }
+    await googleFetch(`${sheet}/values/${encodeURIComponent(quote("DEBRIEFS", "A:D"))}:clear`, { method: "POST" });
+    for (const row of debriefRows.slice(1)) row[0] = `'${row[0]}`;   // keep the date as typed text
+    toWrite = toWrite.concat({ range: quote("DEBRIEFS", "A1"), value: null, rows: debriefRows });
   }
   if (!toWrite.length) return "sheet already up to date";
 
@@ -4805,10 +4842,11 @@ async function syncToSheet() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       valueInputOption: "USER_ENTERED",
-      data: toWrite.map((ch) => ({ range: ch.range, values: [[ch.value]] })),
+      data: toWrite.map((ch) => ({ range: ch.range, values: ch.rows || [[ch.value]] })),
     }),
   });
-  return `synced ${toWrite.length} cell${toWrite.length === 1 ? "" : "s"}`;
+  const cells = toWrite.filter((ch) => !ch.rows).length;
+  return `synced ${cells} cell${cells === 1 ? "" : "s"}` + (debriefRows.length > 1 ? ` + ${debriefRows.length - 1} debrief${debriefRows.length === 2 ? "" : "s"}` : "");
 }
 
 // Run a Google job and report how it went in the panel's header.
