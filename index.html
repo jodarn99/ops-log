@@ -46,7 +46,7 @@
     --ink: #ddd0af;         /* main text */
     --accent: #c4aa77;      /* the month's accent: done, active, today */
     --good: #8fa86a;        /* status 100% */
-    --mid: #d9a441;         /* status 50–99% */
+    --mid: #d9a441;         /* status 50–84% */
     --low: #c2593f;         /* status under 50% */
     /* The rest are mixed from the colors above, so every theme gets them free. */
     --panel: color-mix(in srgb, var(--ground) 93%, var(--ink));       /* section backgrounds */
@@ -387,7 +387,7 @@
   .month.upcoming .bar { color: var(--line); }
 
   /* Status colors, shared by bars and score numbers:
-     100% = good, 50–99% = mid, under 50% = low. Each month's theme
+     85%+ = good, 50–84% = mid, under 50% = low. Each month's theme
      picks its own shades of these that suit its palette. */
   .s-good { color: var(--good) !important; }
   .s-mid  { color: var(--mid) !important; }
@@ -885,8 +885,8 @@
       <div id="year-bars"></div>
     </section>
     <div class="legend">
-      <span><i class="s-good">█</i> 100%</span>
-      <span><i class="s-mid">█</i> 50–99%</span>
+      <span><i class="s-good">█</i> 85%+</span>
+      <span><i class="s-mid">█</i> 50–84%</span>
       <span><i class="s-low">█</i> under 50%</span>
       <span id="chain-legend"></span>
     </div>
@@ -969,8 +969,8 @@
     <section>
       <div class="cal" id="cal"></div>
       <div class="legend cal-legend">
-        <span><i class="s-good">◆</i> over 80%</span>
-        <span><i class="s-mid">◆</i> 50–80%</span>
+        <span><i class="s-good">◆</i> 85%+</span>
+        <span><i class="s-mid">◆</i> 50–84%</span>
         <span><i class="s-low">◆</i> under 50%</span>
         <span>Tap a day to open it</span>
       </div>
@@ -2145,7 +2145,7 @@ const OPERATIONS = {
 
 // Each month's colors. ground, ink and accent come straight from the
 // month rows on your spreadsheet's HQ tab. good / mid / low are the status
-// colors (100% / 50–99% / under 50%), picked to suit each palette and to
+// colors (85%+ / 50–84% / under 50%), picked to suit each palette and to
 // stay readable on its background. light: true = a light-background month.
 const THEMES = {
   "2026-10": { ground: "#14130e", ink: "#ddd0af", accent: "#c4aa77", good: "#8fa86a", mid: "#d9a441", low: "#c2593f" },
@@ -2859,17 +2859,16 @@ function periodScore(year) {
 
 // Which color a score gets. Returns a CSS class name.
 function statusClass(percent) {
-  if (percent >= 100) return "s-good";
+  if (percent >= GOOD_LINE) return "s-good";
   if (percent >= 50) return "s-mid";
   return "s-low";
 }
 
-// The calendar's day diamonds use their own bands (Jordan's call,
-// 2026-10-15): over 80% green, 50–80% gold, under 50% red.
+// Green starts here, for every score color in the app: bars, numbers and
+// the calendar's day diamonds (Jordan's call, 2026-10-15; was 100%).
+const GOOD_LINE = 85;
 function diamondClass(percent) {
-  if (percent > 80) return "s-good";
-  if (percent >= 50) return "s-mid";
-  return "s-low";
+  return statusClass(percent);
 }
 
 // The spreadsheet's status bar: 16 characters, █ for the share done.
