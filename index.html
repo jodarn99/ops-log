@@ -1,3 +1,15 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<!-- Fit the phone's screen: without this line an iPhone draws the page as
+     a 980px-wide desktop page and shrinks it down. viewport-fit=cover lets
+     the dark background run under the notch and home bar. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<!-- Added to the Home Screen, Ops Log opens full screen like an app. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Ops Log">
 <title>Ops Log Field Build</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -50,6 +62,13 @@
     --font-mono: "Special Elite", "Courier New", monospace;
   }
 
+  /* iPhone zooms the page in when you tap a box with text smaller than
+     16px. Keep typing boxes at 16px or more there, so the page stays put.
+     (-webkit-touch-callout only exists on iPhone and iPad.) */
+  @supports (-webkit-touch-callout: none) {
+    input, select, textarea { font-size: max(16px, 1em); }
+  }
+
   /* Hidden screens stay hidden, even though .view sets display: grid. */
   [hidden] { display: none !important; }
 
@@ -66,8 +85,10 @@
   .wrap {
     max-width: 480px;
     margin: 0 auto;
-    padding-inline: 16px;
-    padding-block: 20px 40px;
+    /* env(safe-area-inset-*) = the space taken by the iPhone's notch and
+       home bar, so nothing hides under them. */
+    padding-inline: max(16px, env(safe-area-inset-left)) max(16px, env(safe-area-inset-right));
+    padding-block: max(20px, env(safe-area-inset-top)) max(40px, env(safe-area-inset-bottom));
     display: grid;
     gap: 16px;
   }
@@ -1025,11 +1046,18 @@
         </button>
         <div class="acc-body"><div class="acc-inner" id="data-panel"></div></div>
       </div>
+      <!-- Rarely-needed setup, kept out of the way at the bottom. -->
+      <div class="acc">
+        <button class="acc-head" type="button" aria-expanded="false">
+          <span class="acc-title">ADVANCED</span><span class="acc-sum"></span><span class="acc-arrow">▾</span>
+        </button>
+        <div class="acc-body"><div class="acc-inner" id="advanced-panel"></div></div>
+      </div>
     </div>
   </div>
 
   <p class="note">
-    Practice build. Check-offs save in this browser only, so your real log stays in the Base44 app.
+    Check-offs save on this phone. Back them up to Google Drive from Settings.
     Open this file in a text editor to read and change the code.
   </p>
 </main>
@@ -4779,13 +4807,7 @@ async function runGoogle(label, job) {
 
 function renderGooglePanel() {
   const g = settings.google;
-  const parts = [
-    field("OAuth client ID", (() => {
-      const box = textInput(g.clientId, "OAuth client ID", (v) => { settings.google.clientId = v.trim(); commitSettings(); });
-      box.placeholder = "Built in. Leave blank.";   // GOOGLE_CLIENT_ID is used when this is empty
-      return box;
-    })()),
-  ];
+  const parts = [];
   const actions = el("div", "actions");
   if (!googleUser) {
     actions.append(smallButton("CONNECT GOOGLE", "Sign in with Google", () => runGoogle("connecting", connectGoogle)));
@@ -4891,6 +4913,17 @@ function resetAll() {
   render();
 }
 
+// ADVANCED: the Google client ID. It's built into the app (GOOGLE_CLIENT_ID),
+// so this box stays blank unless you ever make a new client ID.
+function renderAdvancedPanel() {
+  const box = textInput(settings.google.clientId, "OAuth client ID", (v) => { settings.google.clientId = v.trim(); commitSettings(); });
+  box.placeholder = "Built in. Leave blank.";
+  document.getElementById("advanced-panel").replaceChildren(
+    field("Google client ID", box),
+    el("div", "note pad", "Only change this if you make a new client ID in Google Cloud.")
+  );
+}
+
 function renderDataPanel() {
   const fileInput = document.createElement("input");
   fileInput.type = "file";
@@ -4925,6 +4958,7 @@ function renderSettings() {
   renderDisplayEditor();
   renderGooglePanel();
   renderDataPanel();
+  renderAdvancedPanel();
 }
 
 // ---------- the drop-downs: tap a title to open it, the others close ----------
