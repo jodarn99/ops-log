@@ -4489,8 +4489,12 @@ function googleSignIn() {
   return new Promise((resolve, reject) => {
     if (!window.google?.accounts?.oauth2) return reject(new Error("Google's sign-in script hasn't loaded. Are you online?"));
     if (!settings.google.clientId) return reject(new Error("Paste your OAuth client ID first."));
+    // A client ID always ends in .apps.googleusercontent.com. Catch a wrong
+    // paste here (like the client secret) before Google says "invalid_client".
+    if (!settings.google.clientId.trim().endsWith(".apps.googleusercontent.com"))
+      return reject(new Error("That isn't a client ID. Copy the Client ID (it ends in .apps.googleusercontent.com), not the client secret."));
     const client = google.accounts.oauth2.initTokenClient({
-      client_id: settings.google.clientId,
+      client_id: settings.google.clientId.trim(),
       scope: GOOGLE_SCOPES,
       callback: (response) => {
         if (response.error) return reject(new Error(response.error));
@@ -4615,7 +4619,7 @@ async function runGoogle(label, job) {
 function renderGooglePanel() {
   const g = settings.google;
   const parts = [
-    field("OAuth client ID", textInput(g.clientId, "OAuth client ID", (v) => { settings.google.clientId = v; commitSettings(); })),
+    field("OAuth client ID", textInput(g.clientId, "OAuth client ID", (v) => { settings.google.clientId = v.trim(); commitSettings(); })),
   ];
   const actions = el("div", "actions");
   if (!googleUser) {
