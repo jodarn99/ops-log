@@ -4481,8 +4481,23 @@ const GOOGLE_SCOPES = [
   "https://www.googleapis.com/auth/spreadsheets",   // write to your sheet
 ].join(" ");
 
-let googleToken = null;   // { value, expires }. Memory only, never saved.
+// Your Google sign-in is kept on this phone (localStorage), so a refresh
+// or reopening the app doesn't sign you out. Google's token only lasts
+// about an hour; after that the next Google button signs you in again.
+const GOOGLE_KEY = "opslog-google";
+let googleToken = null;   // { value, expires }
 let googleUser = null;    // { name, email, picture }
+try {
+  const saved = JSON.parse(localStorage.getItem(GOOGLE_KEY) || "null");
+  if (saved) {
+    googleUser = saved.user || null;
+    if (saved.token && Date.now() < saved.token.expires - 60000) googleToken = saved.token;
+  }
+} catch { /* nothing saved, or storage blocked: start signed out */ }
+
+function saveGoogle() {
+  try { localStorage.setItem(GOOGLE_KEY, JSON.stringify({ token: googleToken, user: googleUser })); } catch { /* storage blocked */ }
+}
 
 // Open Google's sign-in pop-up and get a token.
 function googleSignIn() {
@@ -4501,6 +4516,7 @@ function googleSignIn() {
       callback: (response) => {
         if (response.error) return reject(new Error(response.error));
         googleToken = { value: response.access_token, expires: Date.now() + response.expires_in * 1000 };
+        saveGoogle();
         resolve(googleToken.value);
       },
       error_callback: (problem) => {
@@ -4545,8 +4561,10 @@ async function finishGoogleRedirect() {
   if (answer.get("state") !== expected) return;   // not an answer we asked for
   if (answer.has("error")) return alert(`Google sign-in failed: ${answer.get("error")}`);
   googleToken = { value: answer.get("access_token"), expires: Date.now() + Number(answer.get("expires_in")) * 1000 };
+  saveGoogle();
   await runGoogle("connecting", async () => {
     googleUser = await googleFetch("https://www.googleapis.com/oauth2/v3/userinfo");
+    saveGoogle();
     if (!settings.name && googleUser.given_name) settings.name = googleUser.given_name;
     commitSettings();
     return "connected";
@@ -4572,6 +4590,7 @@ async function googleFetch(url, options = {}) {
 async function connectGoogle() {
   await googleSignIn();
   googleUser = await googleFetch("https://www.googleapis.com/oauth2/v3/userinfo");
+  saveGoogle();
   if (!settings.name && googleUser.given_name) settings.name = googleUser.given_name;
   commitSettings();
   return "connected";
@@ -4581,6 +4600,7 @@ function disconnectGoogle() {
   if (googleToken && window.google?.accounts?.oauth2) google.accounts.oauth2.revoke(googleToken.value);
   googleToken = null;
   googleUser = null;
+  try { localStorage.removeItem(GOOGLE_KEY); } catch { /* storage blocked */ }
   document.getElementById("google-status").textContent = "not connected";
   render();
 }
@@ -5029,5 +5049,6 @@ document.addEventListener("visibilitychange", () => {
 setupAccordion();   // the Settings drop-downs
 checkAwards();      // the first time, this awards everything earned since Oct 11
 render();
+if (googleUser) document.getElementById("google-status").textContent = "connected";
 finishGoogleRedirect();   // coming back from Google's sign-in page? finish connecting
 </script>
