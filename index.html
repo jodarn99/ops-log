@@ -2307,6 +2307,7 @@ function saveLogs() {
   } catch (error) {
     // Storage is blocked (private window, for example). The page still works for this visit.
   }
+  scheduleAutoSync();   // send it to your Google Sheet in a few seconds
 }
 
 let logs = loadLogs();          // the list of check-offs
@@ -3050,6 +3051,7 @@ function saveReviews() {
   } catch (error) {
     // Storage blocked: answers last for this visit only.
   }
+  scheduleAutoSync();   // send it to your Google Sheet in a few seconds
 }
 
 let reviews = loadReviews();
@@ -4746,7 +4748,40 @@ function cellDone(value) {
   return value === true || String(value ?? "").trim().toLowerCase() === "x";
 }
 
-async function syncToSheet() {
+// ---------- AUTO-SYNC ----------
+// While you're signed in to Google, every check-off and every review answer
+// goes to your sheet by itself, 8 seconds after you stop tapping or typing
+// (so a burst of changes is one trip, not twenty). Opening the app syncs
+// too, which also brings in AAR or Debrief answers you typed in the sheet.
+// Auto-sync never signs you in and never erases anything in the sheet;
+// the SYNC TO SHEET button still does the full job, with its question.
+// (var, not let: saveLogs() can run before this line while the app loads.)
+var autoSyncTimer = null;
+var autoSyncing = false;
+
+function scheduleAutoSync() {
+  if (autoSyncing) return;   // a sync's own saves don't start another sync
+  clearTimeout(autoSyncTimer);
+  autoSyncTimer = setTimeout(autoSync, 8000);
+}
+
+async function autoSync() {
+  const signedIn = googleToken && Date.now() < googleToken.expires - 60000;
+  if (!signedIn || !settings.google.sheetId || !navigator.onLine) return;
+  const status = document.getElementById("google-status");
+  autoSyncing = true;
+  try {
+    status.textContent = "auto-syncing…";
+    status.textContent = `auto: ${await syncToSheet({ quiet: true })}`;
+  } catch (error) {
+    status.textContent = "auto-sync failed (try SYNC TO SHEET)";
+  } finally {
+    autoSyncing = false;
+  }
+}
+
+// options.quiet: auto-sync. No questions; sheet marks the app lacks are kept.
+async function syncToSheet(options = {}) {
   const { sheetId } = settings.google;
   if (!sheetId) throw new Error("Paste your spreadsheet link first.");
   const sheet = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}`;
@@ -4765,10 +4800,14 @@ async function syncToSheet() {
 
   // 2. Read the HQ roster and every month's grid in one trip.
   // (Rows 1–33 are the habit grids; rows 39–55 are the AAR answer boxes.)
+  // The DEBRIEFS tab too, if there is one, to bring in answers typed there.
   const ranges = [quote("HQ", "L9:M40"), ...months.map((tab) => quote(tab, "A1:AK57"))];
+  if (tabs.has("DEBRIEFS")) ranges.push(quote("DEBRIEFS", "A2:D400"));
   const read = await googleFetch(`${sheet}/values:batchGet?valueRenderOption=UNFORMATTED_VALUE&` +
     ranges.map((r) => "ranges=" + encodeURIComponent(r)).join("&"));
   const [roster, ...grids] = read.valueRanges.map((v) => v.values || []);
+  const debriefSheet = tabs.has("DEBRIEFS") ? grids.pop() : [];
+  let pulled = 0;   // answers brought in FROM the sheet
 
   // 3. Match sheet IDs to the app's habits by name ("Morn. Walk" = Morning Walk).
   const plain = (text) => String(text ?? "").trim().toLowerCase();
@@ -4806,19 +4845,36 @@ async function syncToSheet() {
   // 4b. Your monthly AAR answers go in the AFTER ACTION REVIEW boxes on
   //     each month tab (column C, one box per question). Only answers you've
   //     written are sent, so nothing typed in the sheet gets blanked.
+  //     It works the other way too: an answer you typed in the sheet that the
+  //     app doesn't have yet comes INTO the app. (Both have one? The app wins.)
   grids.forEach((grid, i) => {
-    const answers = reviews[`month:${monthKeys[i]}`] || {};
+    const key = `month:${monthKeys[i]}`;
+    const answers = reviews[key] || {};
     for (const [id, row] of Object.entries(AAR_SHEET_ROWS)) {
       const text = (answers[id] || "").trim();
       const inSheet = String((grid[row - 1] || [])[2] ?? "").trim();
       if (text && text !== inSheet) changes.push({ range: quote(months[i], `C${row}`), value: text, clears: false });
+      if (!text && inSheet) { reviews[key] = { ...(reviews[key] || {}), [id]: inSheet }; pulled++; }
     }
   });
+
+  // 4c. Debriefs typed into the DEBRIEFS tab come into the app the same way.
+  const DEBRIEF_COLUMNS = ["wins", "friction", "adjust"];   // columns B, C, D
+  for (const row of debriefSheet) {
+    const week = typeof row[0] === "number" ? dayFromSerial(row[0]) : String(row[0] ?? "").trim().replace(/^'/, "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(week)) continue;
+    const key = `week:${week}`;
+    DEBRIEF_COLUMNS.forEach((id, c) => {
+      const inSheet = String(row[c + 1] ?? "").trim();
+      if (inSheet && !(reviews[key]?.[id] || "").trim()) { reviews[key] = { ...(reviews[key] || {}), [id]: inSheet }; pulled++; }
+    });
+  }
+  if (pulled) { saveReviews(); render(); }
 
   // 5. Marks in the sheet that the app doesn't have: ask before erasing them.
   const clears = changes.filter((ch) => ch.clears).length;
   let toWrite = changes;
-  if (clears && !confirm(`Your sheet has ${clears} check-off${clears === 1 ? "" : "s"} the app doesn't.\n\nOK = erase them so the sheet matches the app.\nCancel = keep them and only add the app's check-offs.`)) {
+  if (clears && (options.quiet || !confirm(`Your sheet has ${clears} check-off${clears === 1 ? "" : "s"} the app doesn't.\n\nOK = erase them so the sheet matches the app.\nCancel = keep them and only add the app's check-offs.`))) {
     toWrite = changes.filter((ch) => !ch.clears);
   }
   // 5b. Weekly Debriefs: the sheet has no place for them, so they get their
@@ -4841,7 +4897,8 @@ async function syncToSheet() {
     for (const row of debriefRows.slice(1)) row[0] = `'${row[0]}`;   // keep the date as typed text
     toWrite = toWrite.concat({ range: quote("DEBRIEFS", "A1"), value: null, rows: debriefRows });
   }
-  if (!toWrite.length) return "sheet already up to date";
+  const fromSheet = pulled ? ` · ${pulled} answer${pulled === 1 ? "" : "s"} from sheet` : "";
+  if (!toWrite.length) return "sheet already up to date" + fromSheet;
 
   // 6. Write all the changed cells in one go.
   await googleFetch(`${sheet}/values:batchUpdate`, {
@@ -4853,7 +4910,7 @@ async function syncToSheet() {
     }),
   });
   const cells = toWrite.filter((ch) => !ch.rows).length;
-  return `synced ${cells} cell${cells === 1 ? "" : "s"}` + (debriefRows.length > 1 ? ` + ${debriefRows.length - 1} debrief${debriefRows.length === 2 ? "" : "s"}` : "");
+  return `synced ${cells} cell${cells === 1 ? "" : "s"}` + (debriefRows.length > 1 ? ` + ${debriefRows.length - 1} debrief${debriefRows.length === 2 ? "" : "s"}` : "") + fromSheet;
 }
 
 // Run a Google job and report how it went in the panel's header.
@@ -5162,4 +5219,5 @@ checkAwards();      // the first time, this awards everything earned since Oct 1
 render();
 if (googleUser) document.getElementById("google-status").textContent = "connected";
 finishGoogleRedirect();   // coming back from Google's sign-in page? finish connecting
+scheduleAutoSync();       // signed in already? catch up with the sheet
 </script>
