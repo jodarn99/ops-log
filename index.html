@@ -69,6 +69,9 @@
     input, select, textarea { font-size: max(16px, 1em); }
   }
 
+  /* HQ's "Show full campaign" button: full width under the month card. */
+  .hq-toggle { justify-self: stretch; }
+
   /* Hidden screens stay hidden, even though .view sets display: grid. */
   [hidden] { display: none !important; }
 
@@ -877,7 +880,7 @@
       <h1 class="hq-title">COMMAND OVERVIEW</h1>
       <div class="op">OCT 2026 – DEC 2027 // ALL THEATERS</div>
     </div>
-    <section>
+    <section id="year-section">
       <div class="head"><h2>// ADVANCE TO OBJECTIVE</h2><span>each month = an equal slice of the year</span></div>
       <div id="year-bars"></div>
     </section>
@@ -888,9 +891,11 @@
       <span id="chain-legend"></span>
     </div>
     <section>
-      <div class="head"><h2>// CAMPAIGN STATUS</h2><span>tap a month to open its calendar</span></div>
+      <div class="head"><h2 id="hq-months-title">// CURRENT OPERATION</h2><span>tap a month to open its calendar</span></div>
       <div id="hq-months"></div>
     </section>
+    <!-- HQ shows only this month. This button opens the whole campaign. -->
+    <button class="mini hq-toggle" id="hq-toggle" type="button">SHOW FULL CAMPAIGN</button>
   </div>
 
   <!-- SCREEN 2: TODAY -->
@@ -2919,11 +2924,18 @@ function yearBar(year) {
   return box;
 }
 
+// HQ focuses on the month you're in. "Show full campaign" brings back
+// the year bars and every month (it resets when you reload the app).
+let hqShowAll = false;
+
 function renderHq() {
   const current = monthOf(todayKey());
   const rows = [];
+  // Before Oct 11 or after Dec 2027 there's no current month: show them all.
+  const focus = !hqShowAll && MONTHS.includes(current);
 
   for (const month of MONTHS) {
+    if (focus && month !== current) continue;   // only this month
     const s = monthScores(month);
     const status = month === current ? "◄ ACTIVE" : month < current ? "COMPLETE" : "UPCOMING";
 
@@ -2974,8 +2986,14 @@ function renderHq() {
   document.getElementById("chain-legend").textContent =
     `Day = daily habits · Week = days ${c.day}% + drills ${c.drills}% · Month = weeks ${c.weeks}% + monthly ops ${c.ops}% · Year = average of months`;
 
-  // The year bars under the title.
+  // The year bars under the title: only with the full campaign showing.
   document.getElementById("year-bars").replaceChildren(yearBar("2026"), yearBar("2027"));
+  document.getElementById("year-section").hidden = focus;
+  document.getElementById("hq-months-title").textContent = focus ? "// CURRENT OPERATION" : "// CAMPAIGN STATUS";
+  const toggle = document.getElementById("hq-toggle");
+  toggle.hidden = !MONTHS.includes(current);
+  toggle.textContent = focus ? "SHOW FULL CAMPAIGN" : "SHOW THIS MONTH ONLY";
+  toggle.onclick = () => { hqShowAll = !hqShowAll; renderHq(); };
 }
 
 // =====================================================================
