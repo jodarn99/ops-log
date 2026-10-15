@@ -4639,7 +4639,17 @@ async function syncToSheet() {
   for (let day = TRACK_START; day <= todayKey(); day = addDays(day, 1)) {
     rows.push([day, ...habits.map((h) => done.has(`${h.id}|${day}`))]);
   }
-  const base = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values`;
+  // Make the tab if your sheet doesn't have it yet (the first sync).
+  const sheet = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}`;
+  const info = await googleFetch(`${sheet}?fields=sheets.properties.title`);
+  if (!info.sheets.some((s) => s.properties.title === sheetTab)) {
+    await googleFetch(`${sheet}:batchUpdate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requests: [{ addSheet: { properties: { title: sheetTab } } }] }),
+    });
+  }
+  const base = `${sheet}/values`;
   // Clear the tab first, so a retired habit's old column doesn't linger.
   await googleFetch(`${base}/${encodeURIComponent(`'${sheetTab}'`)}:clear`, { method: "POST" });
   await googleFetch(`${base}/${encodeURIComponent(`'${sheetTab}'!A1`)}?valueInputOption=USER_ENTERED`, {
