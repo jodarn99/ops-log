@@ -4630,34 +4630,109 @@ function sheetIdFrom(text) {
 }
 
 // Write a table into your sheet: one row per day, one TRUE/FALSE column per habit.
+// ---------- SYNC TO SHEET: fill in your Habit Tracker spreadsheet ----------
+// Your spreadsheet has one tab per month ("OCT 2026", "NOV 2026", ...).
+// On each tab, row 5 holds the dates, column A holds habit IDs (D-01,
+// W-02, M-03...), and a done day is an "x" (or a ticked checkbox).
+// The HQ tab says which habit each ID is (HQ!L9:M26), so we match the
+// app's habits to the sheet by name. Formulas and your AAR answers are
+// never touched: only the day cells of the habit grids.
+
+const MONTH_TABS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+
+// "2026-10-14" -> "OCT 2026", the tab that day lives on.
+function tabFor(day) {
+  return `${MONTH_TABS[Number(day.slice(5, 7)) - 1]} ${day.slice(0, 4)}`;
+}
+
+// Google sends dates as day counts from Dec 30, 1899 (the spreadsheet way).
+function dayFromSerial(serial) {
+  return new Date(Date.UTC(1899, 11, 30) + serial * 86400000).toISOString().slice(0, 10);
+}
+
+// Column number -> letters: 0 = A, 25 = Z, 26 = AA, 32 = AG.
+function columnName(c) {
+  return c < 26 ? String.fromCharCode(65 + c) : String.fromCharCode(64 + Math.floor(c / 26)) + String.fromCharCode(65 + (c % 26));
+}
+
+// Is this cell marked done? "x" or a ticked checkbox both count.
+function cellDone(value) {
+  return value === true || String(value ?? "").trim().toLowerCase() === "x";
+}
+
 async function syncToSheet() {
-  const { sheetId, sheetTab } = settings.google;
+  const { sheetId } = settings.google;
   if (!sheetId) throw new Error("Paste your spreadsheet link first.");
-  const habits = activeHabits();
-  const done = new Set(logs.map((log) => `${log.habit}|${log.date}`));
-  const rows = [["Date", ...habits.map((h) => h.name)]];
-  for (let day = TRACK_START; day <= todayKey(); day = addDays(day, 1)) {
-    rows.push([day, ...habits.map((h) => done.has(`${h.id}|${day}`))]);
-  }
-  // Make the tab if your sheet doesn't have it yet (the first sync).
   const sheet = `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}`;
+  const quote = (tab, range) => `'${tab}'!${range}`;
+
+  // 1. Which month tabs does the sheet have?
   const info = await googleFetch(`${sheet}?fields=sheets.properties.title`);
-  if (!info.sheets.some((s) => s.properties.title === sheetTab)) {
-    await googleFetch(`${sheet}:batchUpdate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requests: [{ addSheet: { properties: { title: sheetTab } } }] }),
-    });
+  const tabs = new Set(info.sheets.map((s) => s.properties.title));
+  if (!tabs.has("HQ")) throw new Error("That spreadsheet has no HQ tab. Is it your Habit Tracker?");
+  const months = [];
+  for (let day = TRACK_START; day <= todayKey(); day = addDays(day, 1)) {
+    const tab = tabFor(day);
+    if (tabs.has(tab) && !months.includes(tab)) months.push(tab);
   }
-  const base = `${sheet}/values`;
-  // Clear the tab first, so a retired habit's old column doesn't linger.
-  await googleFetch(`${base}/${encodeURIComponent(`'${sheetTab}'`)}:clear`, { method: "POST" });
-  await googleFetch(`${base}/${encodeURIComponent(`'${sheetTab}'!A1`)}?valueInputOption=USER_ENTERED`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ values: rows }),
+
+  // 2. Read the HQ roster and every month's grid in one trip.
+  const ranges = [quote("HQ", "L9:M40"), ...months.map((tab) => quote(tab, "A1:AK33"))];
+  const read = await googleFetch(`${sheet}/values:batchGet?valueRenderOption=UNFORMATTED_VALUE&` +
+    ranges.map((r) => "ranges=" + encodeURIComponent(r)).join("&"));
+  const [roster, ...grids] = read.valueRanges.map((v) => v.values || []);
+
+  // 3. Match sheet IDs to the app's habits by name ("Morn. Walk" = Morning Walk).
+  const plain = (text) => String(text ?? "").trim().toLowerCase();
+  const habitForId = {};
+  for (const [id, name] of roster) {
+    const habit = settings.habits.find((h) => plain(h.name) === plain(name) || plain(h.short) === plain(name));
+    if (id && habit) habitForId[id] = habit.id;
+  }
+
+  // 4. Compare every past day cell with the app.
+  const done = new Set(logs.map((log) => `${log.habit}|${log.date}`));
+  const changes = [];   // { range, value, clears }
+  grids.forEach((grid, i) => {
+    const dates = grid[4] || [];   // row 5
+    grid.forEach((row, r) => {
+      const habit = habitForId[row[0]];
+      if (!habit) return;
+      dates.forEach((serial, c) => {
+        if (typeof serial !== "number") return;
+        const day = dayFromSerial(serial);
+        if (day < TRACK_START || day > todayKey()) return;
+        const cell = row[c];
+        const want = done.has(`${habit}|${day}`);
+        if (cellDone(cell) === want) return;
+        const checkbox = cell === true || cell === false;
+        changes.push({
+          range: quote(months[i], `${columnName(c)}${r + 1}`),
+          value: checkbox ? want : want ? "x" : "",
+          clears: !want,
+        });
+      });
+    });
   });
-  return `synced ${rows.length - 1} days`;
+
+  // 5. Marks in the sheet that the app doesn't have: ask before erasing them.
+  const clears = changes.filter((ch) => ch.clears).length;
+  let toWrite = changes;
+  if (clears && !confirm(`Your sheet has ${clears} check-off${clears === 1 ? "" : "s"} the app doesn't.\n\nOK = erase them so the sheet matches the app.\nCancel = keep them and only add the app's check-offs.`)) {
+    toWrite = changes.filter((ch) => !ch.clears);
+  }
+  if (!toWrite.length) return "sheet already up to date";
+
+  // 6. Write all the changed cells in one go.
+  await googleFetch(`${sheet}/values:batchUpdate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      valueInputOption: "USER_ENTERED",
+      data: toWrite.map((ch) => ({ range: ch.range, values: [[ch.value]] })),
+    }),
+  });
+  return `synced ${toWrite.length} cell${toWrite.length === 1 ? "" : "s"}`;
 }
 
 // Run a Google job and report how it went in the panel's header.
@@ -4695,7 +4770,7 @@ function renderGooglePanel() {
     parts.push(
       me,
       field("Spreadsheet link", textInput(g.sheetId, "Spreadsheet link or ID", (v) => { settings.google.sheetId = sheetIdFrom(v); commitSettings(); })),
-      field("Tab name", textInput(g.sheetTab, "Tab to write into", (v) => { settings.google.sheetTab = v || "Ops Log Sync"; commitSettings(); }))
+      el("div", "note pad", "Sync fills in the x's on your Habit Tracker's month tabs (OCT 2026, NOV 2026...). Formulas and AAR answers aren't touched.")
     );
     actions.append(
       smallButton("BACK UP TO DRIVE", "Back up to Google Drive", () => runGoogle("backing up", backupToDrive)),
