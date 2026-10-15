@@ -4487,6 +4487,8 @@ let googleUser = null;    // { name, email, picture }
 // Open Google's sign-in pop-up and get a token.
 function googleSignIn() {
   return new Promise((resolve, reject) => {
+    // Opened from a home-screen icon on iPhone: pop-ups never work there.
+    if (navigator.standalone) return googleRedirectSignIn();
     if (!window.google?.accounts?.oauth2) return reject(new Error("Google's sign-in script hasn't loaded. Are you online?"));
     if (!settings.google.clientId) return reject(new Error("Paste your OAuth client ID first."));
     // A client ID always ends in .apps.googleusercontent.com. Catch a wrong
@@ -4501,9 +4503,53 @@ function googleSignIn() {
         googleToken = { value: response.access_token, expires: Date.now() + response.expires_in * 1000 };
         resolve(googleToken.value);
       },
-      error_callback: (problem) => reject(new Error(problem.message || problem.type)),
+      error_callback: (problem) => {
+        // iPhones often block Google's pop-up (home-screen apps, in-app
+        // browsers, Safari's "Block Pop-ups"). Then sign in on a full page instead.
+        if (problem.type === "popup_failed_to_open") return googleRedirectSignIn();
+        reject(new Error(problem.message || problem.type));
+      },
     });
     client.requestAccessToken();
+  });
+}
+
+// ---------- sign-in without a pop-up (the iPhone way) ----------
+// Instead of a pop-up, the whole page goes to Google's sign-in, and Google
+// sends you back to this page with the token after the # in the address.
+// Needs this page's address listed under "Authorized redirect URIs" in
+// Google Cloud: https://jodarn99.github.io/ops-log/
+function googleRedirectSignIn() {
+  const state = Math.random().toString(36).slice(2);   // proves the answer is for us
+  sessionStorage.setItem("opslog-google-state", state);
+  const params = new URLSearchParams({
+    client_id: settings.google.clientId.trim(),
+    redirect_uri: location.origin + location.pathname,
+    response_type: "token",
+    scope: GOOGLE_SCOPES,
+    include_granted_scopes: "true",
+    state,
+  });
+  location.href = "https://accounts.google.com/o/oauth2/v2/auth?" + params;
+  return new Promise(() => {});   // the page is leaving; nothing more happens here
+}
+
+// Back from Google: read the token from the address, then tidy the address.
+async function finishGoogleRedirect() {
+  if (!window.location?.hash) return;   // nothing after the #: a normal visit
+  const answer = new URLSearchParams(location.hash.slice(1));
+  if (!answer.has("access_token") && !answer.has("error")) return;
+  history.replaceState(null, "", location.pathname);   // hide the token from the address bar
+  const expected = sessionStorage.getItem("opslog-google-state");
+  sessionStorage.removeItem("opslog-google-state");
+  if (answer.get("state") !== expected) return;   // not an answer we asked for
+  if (answer.has("error")) return alert(`Google sign-in failed: ${answer.get("error")}`);
+  googleToken = { value: answer.get("access_token"), expires: Date.now() + Number(answer.get("expires_in")) * 1000 };
+  await runGoogle("connecting", async () => {
+    googleUser = await googleFetch("https://www.googleapis.com/oauth2/v3/userinfo");
+    if (!settings.name && googleUser.given_name) settings.name = googleUser.given_name;
+    commitSettings();
+    return "connected";
   });
 }
 
@@ -4898,4 +4944,5 @@ document.addEventListener("visibilitychange", () => {
 setupAccordion();   // the Settings drop-downs
 checkAwards();      // the first time, this awards everything earned since Oct 11
 render();
+finishGoogleRedirect();   // coming back from Google's sign-in page? finish connecting
 </script>
