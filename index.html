@@ -4485,6 +4485,14 @@ const GOOGLE_SCOPES = [
 // or reopening the app doesn't sign you out. Google's token only lasts
 // about an hour; after that the next Google button signs you in again.
 const GOOGLE_KEY = "opslog-google";
+
+// Your Google Cloud client ID, built in so you never have to paste it.
+// (It isn't a secret: it only says WHICH app is asking Google.)
+// A client ID typed in Settings still wins, if you ever make a new one.
+const GOOGLE_CLIENT_ID = "569187449524-v6t8tmnjfu4af7jg0b894qthm3o8m4lr.apps.googleusercontent.com";
+function googleClientId() {
+  return (settings.google.clientId || GOOGLE_CLIENT_ID).trim();
+}
 let googleToken = null;   // { value, expires }
 let googleUser = null;    // { name, email, picture }
 try {
@@ -4502,18 +4510,18 @@ function saveGoogle() {
 // Open Google's sign-in pop-up and get a token.
 function googleSignIn() {
   return new Promise((resolve, reject) => {
+    if (!googleClientId()) return reject(new Error("Paste your OAuth client ID first."));
+    // A client ID always ends in .apps.googleusercontent.com. Catch a wrong
+    // paste here (like the client secret) before Google says "invalid_client".
+    if (!googleClientId().endsWith(".apps.googleusercontent.com"))
+      return reject(new Error("That isn't a client ID. Copy the Client ID (it ends in .apps.googleusercontent.com), not the client secret."));
     // iPhone and iPad: Google's pop-up is unreliable there (blocked pop-ups,
     // home-screen apps), so always use the full-page sign-in instead.
     const apple = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
     if (apple || navigator.standalone) return googleRedirectSignIn();
     if (!window.google?.accounts?.oauth2) return reject(new Error("Google's sign-in script hasn't loaded. Are you online?"));
-    if (!settings.google.clientId) return reject(new Error("Paste your OAuth client ID first."));
-    // A client ID always ends in .apps.googleusercontent.com. Catch a wrong
-    // paste here (like the client secret) before Google says "invalid_client".
-    if (!settings.google.clientId.trim().endsWith(".apps.googleusercontent.com"))
-      return reject(new Error("That isn't a client ID. Copy the Client ID (it ends in .apps.googleusercontent.com), not the client secret."));
     const client = google.accounts.oauth2.initTokenClient({
-      client_id: settings.google.clientId.trim(),
+      client_id: googleClientId(),
       scope: GOOGLE_SCOPES,
       callback: (response) => {
         if (response.error) return reject(new Error(response.error));
@@ -4541,7 +4549,7 @@ function googleRedirectSignIn() {
   const state = Math.random().toString(36).slice(2);   // proves the answer is for us
   sessionStorage.setItem("opslog-google-state", state);
   const params = new URLSearchParams({
-    client_id: settings.google.clientId.trim(),
+    client_id: googleClientId(),
     redirect_uri: location.origin + location.pathname,
     response_type: "token",
     scope: GOOGLE_SCOPES,
@@ -4772,7 +4780,11 @@ async function runGoogle(label, job) {
 function renderGooglePanel() {
   const g = settings.google;
   const parts = [
-    field("OAuth client ID", textInput(g.clientId, "OAuth client ID", (v) => { settings.google.clientId = v.trim(); commitSettings(); })),
+    field("OAuth client ID", (() => {
+      const box = textInput(g.clientId, "OAuth client ID", (v) => { settings.google.clientId = v.trim(); commitSettings(); });
+      box.placeholder = "Built in. Leave blank.";   // GOOGLE_CLIENT_ID is used when this is empty
+      return box;
+    })()),
   ];
   const actions = el("div", "actions");
   if (!googleUser) {
