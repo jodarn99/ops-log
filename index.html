@@ -969,8 +969,8 @@
     <section>
       <div class="cal" id="cal"></div>
       <div class="legend cal-legend">
-        <span><i class="s-good">◆</i> all daily orders</span>
-        <span><i class="s-mid">◆</i> 50–99%</span>
+        <span><i class="s-good">◆</i> over 80%</span>
+        <span><i class="s-mid">◆</i> 50–80%</span>
         <span><i class="s-low">◆</i> under 50%</span>
         <span>Tap a day to open it</span>
       </div>
@@ -2660,7 +2660,7 @@ function renderGrid() {
       cell.disabled = !tracked;
       if (tracked) {
         const score = dayScore(day);
-        cell.append(el("span", "diamond " + (score === null ? "none" : statusClass(score))));
+        cell.append(el("span", "diamond " + (score === null ? "none" : diamondClass(score))));
         cell.setAttribute("aria-label", `${shortDate(day)}, ${score}% of daily orders`);
         // Tapping a day: open it on the Today screen.
         const tappedDay = day;   // keep this loop's value for the click later
@@ -2860,6 +2860,14 @@ function periodScore(year) {
 // Which color a score gets. Returns a CSS class name.
 function statusClass(percent) {
   if (percent >= 100) return "s-good";
+  if (percent >= 50) return "s-mid";
+  return "s-low";
+}
+
+// The calendar's day diamonds use their own bands (Jordan's call,
+// 2026-10-15): over 80% green, 50–80% gold, under 50% red.
+function diamondClass(percent) {
+  if (percent > 80) return "s-good";
   if (percent >= 50) return "s-mid";
   return "s-low";
 }
