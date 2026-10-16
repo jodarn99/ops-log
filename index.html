@@ -921,6 +921,12 @@
   .chip.suggest { border-color: var(--accent); color: var(--accent); }
   .chip.picked { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 
+  /* ---------- year-to-date net worth graph ---------- */
+  .ytd-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; padding: 10px 12px 0; font: 10px var(--font-mono); letter-spacing: .1em; color: var(--muted); }
+  .ytd-stats b { display: block; font: 400 19px var(--font-display); color: var(--ink); letter-spacing: .02em; font-variant-numeric: tabular-nums; }
+  #fin-ytd { display: block; touch-action: pan-y; cursor: crosshair; }
+  #fin-ytd text { font-size: 10px; }
+
   /* ---------- account rows ---------- */
   .ico { width: 30px; height: 30px; border: 1px solid var(--line); border-radius: 3px; display: grid; place-items: center; font: 11px var(--font-mono); color: var(--accent); flex-shrink: 0; }
 
@@ -1212,6 +1218,13 @@
 
   <!-- ===== NET WORTH ===== -->
   <div id="fin-pane-worth" style="display:none;gap:16px">
+    <!-- Year-to-date net worth: one point per day you open War Chest -->
+    <section>
+      <div class="head"><h2>// NET WORTH</h2><span id="fin-ytd-label"></span></div>
+      <div class="ytd-stats" id="fin-ytd-stats"></div>
+      <svg id="fin-ytd" viewBox="0 0 440 170" width="100%" role="img" aria-label="Net worth this year"></svg>
+      <div class="note" id="fin-ytd-note" style="padding-top:0"></div>
+    </section>
     <section>
       <div class="head"><h2>// ACCOUNTS</h2><span>TAP ONE TO UPDATE ITS BALANCE</span></div>
       <div id="fin-accts"></div>
@@ -5387,6 +5400,8 @@ const DEFAULT_FINANCE = {
   accounts: [],   // { id, name, type, balance }
   incoming: [],   // charges read from statements, waiting to be sorted (see "INCOMING" below)
   rules: {},      // merchant -> budget line you sorted it into last time, so it's suggested next time
+  history: {},    // "YYYY-MM-DD" -> net worth that day (saved each day you open War Chest), for the year-to-date graph
+  historySample: [],   // the made-up days LOAD SAMPLE added, so CLEAR SAMPLE can take them out
 };
 
 // ---------- date helpers (dates are "YYYY-MM-DD" text; todayKey() and monthOf() come from the app) ----------
@@ -5463,6 +5478,31 @@ function finBarState(spent, limit, bill, pace) {
 function finNetWorth(accounts) {
   return finRound(accounts.reduce((t, a) => t + (a.type === "credit" ? -a.balance : a.balance), 0));
 }
+// ---------- NET WORTH HISTORY ----------
+
+// Save today's net worth. Called every time War Chest draws, so the last
+// value of the day wins. Returns true when something changed (so we save).
+function finRecordNetWorth(fin, today) {
+  if (!fin.accounts.length) return false;
+  const nw = finNetWorth(fin.accounts);
+  if (fin.history[today] === nw) return false;
+  fin.history[today] = nw;
+  fin.historySample = fin.historySample.filter((d) => d !== today);   // a real value replaces a sample one
+  if (fin.accounts.some((a) => a.sample)) fin.historySample.push(today); // made from sample accounts: CLEAR SAMPLE removes it
+  return true;
+}
+
+// One year's saved days, oldest first: [["2026-10-16", 14612.25], ...]
+function finYearSeries(history, year) {
+  return Object.keys(history).filter((d) => d.startsWith(year + "-")).sort().map((d) => [d, history[d]]);
+}
+
+// Day of the year: Jan 1 = 0. Used to place points along the year.
+function finDayOfYear(date) {
+  const [y, m, d] = date.split("-").map(Number);
+  return (Date.UTC(y, m - 1, d) - Date.UTC(y, 0, 1)) / 86400000;
+}
+
 // ---------- INCOMING: reading bank statements ----------
 
 // Split CSV text (what banks give you when you "download transactions") into rows of cells.
@@ -5708,10 +5748,88 @@ function finUnfile(t) {
   Object.assign(t, { done: false, cat: null, expId: null });
 }
 
+// ----- the year-to-date net worth graph -----
+// x = day of the year (Jan 1 on the left, today on the right), y = net worth.
+// Tap or drag along it to read any day; it rests on the latest day.
+const FIN_YTD = { W: 440, H: 170, L: 46, R: 10, T: 12, B: 22 };
+let finYtdPoints = [];
+function finDrawYtd(today) {
+  const year = today.slice(0, 4);
+  const pts = finYearSeries(fin.history, year);
+  const { W, H, L, R, T, B } = FIN_YTD;
+  finEl("fin-ytd-label").textContent = year + " YEAR TO DATE";
+  const svg = finEl("fin-ytd");
+  if (!pts.length) {
+    finEl("fin-ytd-stats").innerHTML = "";
+    svg.innerHTML = "";
+    svg.style.display = "none";
+    finEl("fin-ytd-note").textContent = "Add your accounts below. Each day you open War Chest, today's net worth is saved and the line grows.";
+    return;
+  }
+  svg.style.display = "";
+  const first = pts[0][1], last = pts[pts.length - 1][1], change = finRound(last - first);
+  const pct = first ? change / Math.abs(first) * 100 : 0;
+  finEl("fin-ytd-stats").innerHTML =
+    `<div>${finDayName(pts[0][0])}<b>${finShort(first)}</b></div><div>NOW<b>${finShort(last)}</b></div>` +
+    `<div>CHANGE<b class="${change >= 0 ? "up" : "down"}">${change >= 0 ? "▲" : "▼"} ${finShort(Math.abs(change))}</b>${first ? (change >= 0 ? "+" : "") + pct.toFixed(1) + "%" : ""}</div>`;
+
+  // Scales: the whole year so far across, a little room above and below the line
+  const endDay = Math.max(finDayOfYear(today), 1);
+  let lo = Math.min(...pts.map((p) => p[1])), hi = Math.max(...pts.map((p) => p[1]));
+  const padY = Math.max((hi - lo) * 0.15, Math.abs(hi) * 0.02, 50);
+  lo -= padY; hi += padY;
+  const x = (date) => L + finDayOfYear(date) / endDay * (W - L - R);
+  const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+  finYtdPoints = pts.map(([d, v]) => ({ d, v, x: x(d), y: y(v) }));
+
+  let g = "";
+  // three faint grid lines with their values
+  [lo + (hi - lo) * 0.1, (lo + hi) / 2, hi - (hi - lo) * 0.1].forEach((v) => {
+    g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" style="stroke:var(--line)"/><text x="${L - 6}" y="${y(v) + 3}" text-anchor="end">${finShort(v).replace(".0K", "K")}</text>`;
+  });
+  // month names along the bottom (only months that have started)
+  for (let m = 1; m <= Number(today.slice(5, 7)); m++) {
+    const d = `${year}-${finPad(m)}-01`;
+    g += `<text x="${x(d) + 2}" y="${H - 6}" text-anchor="start">${FIN_MONTHS[m - 1][0]}</text>`;
+  }
+  const line = finYtdPoints.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  if (finYtdPoints.length > 1) {
+    g += `<polygon points="${finYtdPoints[0].x},${H - B} ${line} ${finYtdPoints[finYtdPoints.length - 1].x},${H - B}" style="fill:var(--accent);opacity:.12"/>`;
+    g += `<polyline points="${line}" style="fill:none;stroke:var(--accent);stroke-width:2;stroke-linejoin:round;stroke-linecap:round"/>`;
+  }
+  g += `<g id="fin-ytd-hover"></g>`;
+  svg.innerHTML = g;
+  finYtdHover(finYtdPoints.length - 1);
+  const sample = fin.historySample.length ? " Sample history is mixed in; CLEAR SAMPLE on Spending removes it." : "";
+  finEl("fin-ytd-note").textContent = (finYtdPoints.length < 3 ? `Saved since ${finDayName(pts[0][0])}. A new point is added each day you open War Chest.` : "Tap or drag along the line to read any day.") + sample;
+}
+
+// Marker + label for one point (the latest, or the one under your finger)
+function finYtdHover(i) {
+  const p = finYtdPoints[i], hover = finEl("fin-ytd-hover");
+  if (!p || !hover) return;
+  const { W, T, B, H } = FIN_YTD;
+  const label = `${finDayName(p.d)} · ${finMoney(p.v)}`;
+  const tx = Math.min(Math.max(p.x, 70), W - 70);
+  hover.innerHTML = `<line x1="${p.x}" x2="${p.x}" y1="${T}" y2="${H - B}" style="stroke:var(--muted);stroke-dasharray:2 3"/>` +
+    `<circle cx="${p.x}" cy="${p.y}" r="4.5" style="fill:var(--accent);stroke:var(--panel);stroke-width:2"/>` +
+    `<text x="${tx}" y="${T + 2}" text-anchor="middle" style="fill:var(--ink);font-size:11px">${label}</text>`;
+}
+finEl("fin-ytd").addEventListener("pointermove", (ev) => {
+  if (!finYtdPoints.length) return;
+  const box = finEl("fin-ytd").getBoundingClientRect();
+  const sx = (ev.clientX - box.left) / box.width * FIN_YTD.W;   // finger position in chart units
+  let best = 0;
+  finYtdPoints.forEach((p, i) => { if (Math.abs(p.x - sx) < Math.abs(finYtdPoints[best].x - sx)) best = i; });
+  finYtdHover(best);
+});
+finEl("fin-ytd").addEventListener("pointerleave", () => finYtdHover(finYtdPoints.length - 1));
+
 // =====================================================================
 // WAR CHEST 4. DRAW THE SCREEN
 // =====================================================================
 function renderFinance() {
+  if (finRecordNetWorth(fin, todayKey())) saveFinance();   // today's point on the net worth graph
   const today = todayKey();
   const spentMap = finSpentByCategory(fin.expenses, finMonth);
   const monthSpent = finRound(Object.values(spentMap).reduce((t, v) => t + v, 0));
@@ -5801,6 +5919,8 @@ function renderFinance() {
     html += `<button class="tx" type="button" data-exp="${e.id}"><div class="who"><div>${finEsc(e.note || (cat ? cat.name : "Expense"))}</div><div class="tag">${finEsc(cat ? cat.name : "No category").toUpperCase()}</div></div><div class="finMoney">−${finMoney(e.amount, true)}</div></button>`;
   });
   finEl("fin-txs").innerHTML = html || `<div class="note">Nothing logged for ${finMonthName(finMonth)} yet.</div>`;
+
+  finDrawYtd(today);
 
   // ----- incoming: unsorted lines first (oldest on top), this month's sorted ones below -----
   const acctName = (id) => (fin.accounts.find((a) => a.id === id) || { name: "?" }).name;
@@ -5984,6 +6104,8 @@ finEl("fin-sample").onclick = () => {
     fin.expenses = fin.expenses.filter((e) => !ids.has(e.id));
     fin.incoming = fin.incoming.filter((t) => !t.sample);
     fin.accounts = fin.accounts.filter((a) => !a.sample);
+    fin.historySample.forEach((d) => delete fin.history[d]);
+    fin.historySample = [];
   } else {
     FIN_SAMPLE.forEach((s) => {
       let acct = fin.accounts.find((a) => a.name === s.name);
@@ -5991,6 +6113,16 @@ finEl("fin-sample").onclick = () => {
     });
     FIN_SAMPLE.filter((s) => s.csv).forEach((s) => finAddStatement(fin, fin.accounts.find((a) => a.name === s.name).id, s.csv, finId, true));
     finMonth = "2026-10";
+    // A made-up year so far for the net worth graph: twice a month, Jan 1 to yesterday
+    const today = todayKey(), year = today.slice(0, 4), end = finNetWorth(fin.accounts);
+    const days = [];
+    for (let m = 1; m <= 12; m++) for (const d of [1, 15]) { const k = `${year}-${finPad(m)}-${finPad(d)}`; if (k < today) days.push(k); }
+    days.forEach((k, i) => {
+      if (fin.history[k] !== undefined) return;            // never cover a real day
+      const t = i / days.length;
+      fin.history[k] = finRound(end * (0.62 + 0.38 * t) + Math.sin(i * 1.7) * 260);
+      fin.historySample.push(k);
+    });
   }
   saveFinance(); renderFinance();
 };
