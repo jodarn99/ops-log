@@ -909,6 +909,18 @@
   .tx .who div:first-child { font-weight: 600; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .money { font: 600 17px var(--font-body); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
+  /* ---------- incoming: habit-style rows with category chips under each ---------- */
+  .inc { border-bottom: 1px solid var(--line); }
+  .inc:last-child { border-bottom: 0; }
+  .inc .row { border-bottom: 0; padding-bottom: 6px; }
+  .inc .who { flex: 1; min-width: 0; }
+  .inc .who div:first-child { font-weight: 600; font-size: 16px; letter-spacing: .05em; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .inc.done .who div:first-child { color: var(--accent); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 12px 10px 46px; }
+  .chip { border: 1px solid var(--line); background: transparent; color: var(--muted); border-radius: 12px; padding: 5px 10px; font: 10px var(--font-mono); letter-spacing: .08em; cursor: pointer; }
+  .chip.suggest { border-color: var(--accent); color: var(--accent); }
+  .chip.picked { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+
   /* ---------- account rows ---------- */
   .ico { width: 30px; height: 30px; border: 1px solid var(--line); border-radius: 3px; display: grid; place-items: center; font: 11px var(--font-mono); color: var(--accent); flex-shrink: 0; }
 
@@ -1177,6 +1189,16 @@
 
   <!-- ===== SPENDING ===== -->
   <div id="fin-pane-spend" style="display:none;gap:16px">
+    <!-- Every charge from your statements lands here unchecked, like a habit.
+         Sort it into a budget line and it checks off and counts toward that line. -->
+    <section>
+      <div class="head"><h2>// INCOMING</h2><span id="fin-inc-count"></span></div>
+      <div id="fin-incoming"></div>
+    </section>
+    <div class="fin-two">
+      <button class="btn" type="button" id="fin-import">IMPORT STATEMENT</button>
+      <button class="btn dashed" type="button" id="fin-sample">LOAD SAMPLE</button>
+    </div>
     <section>
       <div class="head"><h2>// WHERE IT WENT</h2><span id="fin-spend-label"></span></div>
       <div class="donut-wrap" id="fin-donut-wrap"><svg id="fin-donut" viewBox="0 0 140 140" width="140" height="140" aria-label="Spending by group"></svg><div class="flegend" id="fin-legend"></div></div>
@@ -1224,6 +1246,17 @@
     <label>WHERE / NOTE<input id="exp-note" type="text" maxlength="40" placeholder="e.g. Raley's"></label>
     <div class="fin-two"><button class="btn" value="cancel" formnovalidate>CANCEL</button><button class="btn" value="save">SAVE</button></div>
     <button class="btn danger" value="delete" formnovalidate id="exp-del">DELETE THIS EXPENSE</button>
+  </form>
+</dialog>
+
+<!-- ===== Pop-up: import a bank statement (a .csv file from your bank's website) ===== -->
+<dialog class="fin-dlg" id="dlg-imp">
+  <form method="dialog" id="f-imp">
+    <h3>Import statement</h3>
+    <label>WHICH ACCOUNT IS IT FROM?<select id="imp-acct"></select></label>
+    <label>STATEMENT FILE (.CSV)<input id="imp-file" type="file" accept=".csv,text/csv" required></label>
+    <div class="note" style="padding:0">On your bank's website, look for "Download transactions" and pick CSV. Paychecks and money moved back into checking are skipped.</div>
+    <div class="fin-two"><button class="btn" value="cancel" formnovalidate>CANCEL</button><button class="btn" value="save">IMPORT</button></div>
   </form>
 </dialog>
 
@@ -5352,6 +5385,8 @@ const DEFAULT_FINANCE = {
   expenses: [],   // { id, date: "YYYY-MM-DD", cat, amount, note }
   payday: {},     // payday date -> { transfer id: true } for checked-off transfers
   accounts: [],   // { id, name, type, balance }
+  incoming: [],   // charges read from statements, waiting to be sorted (see "INCOMING" below)
+  rules: {},      // merchant -> budget line you sorted it into last time, so it's suggested next time
 };
 
 // ---------- date helpers (dates are "YYYY-MM-DD" text; todayKey() and monthOf() come from the app) ----------
@@ -5428,7 +5463,181 @@ function finBarState(spent, limit, bill, pace) {
 function finNetWorth(accounts) {
   return finRound(accounts.reduce((t, a) => t + (a.type === "credit" ? -a.balance : a.balance), 0));
 }
+// ---------- INCOMING: reading bank statements ----------
+
+// Split CSV text (what banks give you when you "download transactions") into rows of cells.
+// Handles "quoted, cells" and "" inside quotes.
+function finParseCSV(text) {
+  const rows = []; let row = [], cell = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (c === '"') quoted = false;
+      else cell += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ",") { row.push(cell); cell = ""; }
+    else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(cell); cell = "";
+      if (row.some((x) => x.trim() !== "")) rows.push(row);
+      row = [];
+    } else cell += c;
+  }
+  row.push(cell);
+  if (row.some((x) => x.trim() !== "")) rows.push(row);
+  return rows;
+}
+
+// "10/05/2026" or "2026-10-05" -> "2026-10-05"
+function finDate(text) {
+  const t = text.trim();
+  let m = t.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return `${m[1]}-${finPad(m[2])}-${finPad(m[3])}`;
+  m = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (m) return `${m[3].length === 2 ? "20" + m[3] : m[3]}-${finPad(m[1])}-${finPad(m[2])}`;
+  return null;
+}
+
+// Turn a statement into { date, desc, amount } rows. Money OUT is negative.
+// Banks name their columns differently, so we look for words in the header row.
+// Some card statements list purchases as positive numbers; for a credit card we
+// flip the signs when most rows are positive.
+function finReadStatement(text, isCard) {
+  const rows = finParseCSV(text);
+  if (rows.length < 2) return [];
+  const head = rows[0].map((h) => h.trim().toLowerCase());
+  const find = (...words) => head.findIndex((h) => words.some((w) => h.includes(w)));
+  const dateCol = find("trans", "posted", "date");
+  const descCol = find("description", "payee", "merchant", "name", "memo");
+  const amtCol = find("amount");
+  const debitCol = find("debit", "withdrawal"), creditCol = find("credit", "deposit");
+  if (dateCol < 0 || descCol < 0 || (amtCol < 0 && debitCol < 0)) throw new Error("Couldn't find the date, description and amount columns in that file.");
+  const money = (x) => Number(String(x || "").replace(/[$,\s]/g, "").replace(/^\((.*)\)$/, "-$1")) || 0;   // "(12.50)" means -12.50
+  let list = rows.slice(1).map((r) => ({
+    date: finDate(r[dateCol] || ""),
+    desc: (r[descCol] || "").trim().replace(/\s+/g, " "),
+    amount: finRound(amtCol >= 0 ? money(r[amtCol]) : money(r[creditCol]) - Math.abs(money(r[debitCol]))),
+  })).filter((r) => r.date && r.desc && r.amount);
+  if (isCard && list.filter((r) => r.amount > 0).length > list.length / 2) list = list.map((r) => ({ ...r, amount: -r.amount }));
+  return list;
+}
+
+// The part of a description that names the store: "RALEYS #112 RENO NV" -> "RALEYS".
+// Used to remember how you sorted it.
+function finMerchantKey(desc) {
+  return desc.toUpperCase().replace(/[#*].*$/, "").replace(/[^A-Z&.\- ]/g, " ").trim().split(/\s+/).slice(0, 2).join(" ");
+}
+
+// Words that give away what a charge is, for the first time you see a store.
+const FIN_KEYWORDS = [
+  [/RENT|APTS|APARTMENT/, "rent"], [/BUTCHERBOX/, "butcher"], [/PROGRESSIVE|GEICO|STATE FARM|ALLSTATE/, "carins"],
+  [/T-MOBILE|VERIZON|AT&T|MINT MOBILE/, "phone"], [/FITNESS|GYM|BOXING/, "gym"], [/SPOTIFY/, "spotify"], [/APPLE\.COM/, "apple"],
+  [/NV ENERGY|ENERGY/, "electric"], [/TMWA|WATER|WASTE MGMT|WASTE MANAGEMENT/, "water"], [/LEMONADE|RENTERS/, "renters"],
+  [/RALEY|WINCO|SAFEWAY|SMITH'?S|TRADER JOE|SPROUTS|COSTCO WHSE/, "groceries"], [/CHEVRON|SHELL|ARCO|MAVERIK|EXXON|COSTCO GAS|\b76\b/, "gas"],
+  [/BREW|RESTAURANT|GRILL|CAFE|COFFEE|STARBUCKS|PIZZA|IN-N-OUT|TACO|BURGER/, "dining"], [/TARGET|WALGREENS|CVS|AMAZON|WALMART/, "household"],
+];
+
+// The budget line to suggest for a charge: how you sorted this store before,
+// then the keyword list, then a bill whose amount matches exactly.
+function finSuggest(desc, amount, fin) {
+  const learned = fin.rules[finMerchantKey(desc)];
+  if (learned && fin.categories.some((c) => c.id === learned)) return learned;
+  const up = desc.toUpperCase();
+  const hit = FIN_KEYWORDS.find(([re, id]) => re.test(up) && fin.categories.some((c) => c.id === id));
+  if (hit) return hit[1];
+  const bills = fin.categories.filter((c) => c.bill && Math.abs(c.limit - Math.abs(amount)) < 0.005);
+  return bills.length === 1 ? bills[0].id : null;
+}
+
+// Which of your savings / investment accounts a transfer went to (by its name in the description).
+function finTransferTarget(up, accounts) {
+  const words = (a) => a.name.toUpperCase().split(/\s+/).filter((w) => w.length > 2);
+  const named = accounts.find((a) => a.type !== "checking" && a.type !== "credit" && words(a).some((w) => up.includes(w)));
+  if (named) return named;
+  if (/ROTH/.test(up)) return accounts.find((a) => /ROTH/i.test(a.name));
+  if (/BROKERAGE|STOCK|INVEST/.test(up)) return accounts.find((a) => a.type === "investment" && !/ROTH/i.test(a.name));
+  if (/SAVINGS|HYSA/.test(up)) return accounts.find((a) => a.type === "savings");
+  return null;
+}
+
+// What kind of line this is:
+//   "spend"   money spent: sort it into a budget line
+//   "cardpay" a credit card bill paid from checking: sort it into that card's line
+//   "deposit" money moved into one of your savings / investment accounts (shown as +$ to that account)
+//   "tithe"   tithing, which you keep separate from spending
+//   "hide"    paychecks, the card's side of a payment, money moved back to checking
+// `to` = the account (or payday transfer) it went to.
+function finClassify(row, acct, fin) {
+  const up = row.desc.toUpperCase();
+  const isTransfer = /TRANSFER|XFER/.test(up);
+  if (row.amount > 0) return { kind: "hide" };                                 // money coming in
+  if (/TITHE|TITHING|OFFERING|CHURCH/.test(up)) return { kind: "tithe", to: "tithing" };
+  if (acct.type !== "credit") {
+    const card = fin.accounts.find((a) => a.type === "credit" && a.name.toUpperCase().split(/\s+/).some((w) => w.length > 2 && up.includes(w)));
+    if (card && (/PAYMENT|PMT|PAY/.test(up))) return { kind: "cardpay", to: card.id };
+    if (/CARD PAYMENT|CRCARDPMT|CREDIT CARD PMT|E-PAYMENT/.test(up)) return { kind: "cardpay", to: null };
+  }
+  if (isTransfer || /VANGUARD|FIDELITY|SCHWAB|ROBINHOOD/.test(up)) {
+    const target = finTransferTarget(up, fin.accounts);
+    return target ? { kind: "deposit", to: target.id } : { kind: "hide" };
+  }
+  return { kind: "spend" };
+}
+
+// The payday on or before a date (transfers made on payday count toward that payday's orders).
+function finPrevPayday(date, paydays) {
+  const days = [...paydays].sort((a, b) => a - b);
+  const month = monthOf(date), day = Number(date.slice(8));
+  const hit = [...days].reverse().find((d) => d <= day);
+  if (hit) return `${month}-${finPad(hit)}`;
+  const prev = finAddMonths(month, -1);
+  return `${prev}-${finPad(Math.min(days[days.length - 1], finDaysInMonth(prev)))}`;
+}
+
+// Which payday transfer a deposit counts as: tithing, Roth, stocks or high-yield savings.
+function finFundFor(item, fin) {
+  if (item.kind === "tithe") return "tithing";
+  const a = fin.accounts.find((x) => x.id === item.to);
+  if (!a) return null;
+  if (/ROTH/i.test(a.name)) return "roth";
+  if (a.type === "investment") return "stocks";
+  if (a.type === "savings") return "hysa";
+  return null;
+}
+
+// Add a statement's lines to the Incoming list. Lines already there (same account,
+// date, description, amount) are skipped, so loading the same file twice is safe.
+// Returns how many new lines were added.
+function finAddStatement(fin, acctId, text, makeId, sample) {
+  const acct = fin.accounts.find((a) => a.id === acctId);
+  const rows = finReadStatement(text, acct.type === "credit");
+  const seen = {};
+  let added = 0;
+  rows.forEach((r) => {
+    const base = `${acctId}|${r.date}|${r.desc}|${r.amount}`;
+    seen[base] = (seen[base] || 0) + 1;              // two identical coffees the same day are two lines
+    const key = `${base}|${seen[base]}`;
+    if (fin.incoming.some((x) => x.key === key)) return;
+    const c = finClassify(r, acct, fin);
+    if (c.kind === "hide") return;
+    fin.incoming.push({ id: makeId(), key, acct: acctId, date: r.date, desc: r.desc, amount: r.amount, kind: c.kind, to: c.to || null, done: false, cat: null, expId: null, sample: !!sample });
+    added++;
+  });
+  return added;
+}
 // ==CORE END==
+
+// ---------- SAMPLE STATEMENTS (made up) so you can try Incoming before the bank link ----------
+// The same three files are in finance/sample-statements/.
+const FIN_SAMPLE = [
+  { name: "Checking", type: "checking", balance: 1635.92, csv: "Date,Description,Amount,Running Bal.\n10/01/2026,RENT PAYMENT PARKSIDE APTS,-1300.00,812.44\n10/02/2026,PROGRESSIVE INS AUTOPAY,-101.00,711.44\n10/03/2026,CRUNCH FITNESS RENO,-32.00,679.44\n10/05/2026,PAYROLL DIRECT DEPOSIT,1850.00,2529.44\n10/05/2026,TITHE.LY GIVING - RENO CHURCH,-185.00,2344.44\n10/05/2026,ONLINE TRANSFER TO ROTH IRA XXXX3301,-73.80,2270.64\n10/05/2026,ONLINE TRANSFER TO BROKERAGE XXXX3302,-73.80,2196.84\n10/05/2026,ONLINE TRANSFER TO HIGH YIELD SAVINGS XXXX9020,-344.40,1852.44\n10/06/2026,T-MOBILE AUTOPAY,-25.00,1827.44\n10/08/2026,DISCOVER E-PAYMENT,-150.00,1677.44\n10/09/2026,NV ENERGY PAYMENT,-68.40,1609.04\n10/10/2026,TMWA WATER BILL,-58.12,1550.92\n10/12/2026,LEMONADE INSURANCE,-15.00,1535.92\n10/14/2026,ONLINE TRANSFER FROM HIGH YIELD SAVINGS XXXX9020,100.00,1635.92\n" },
+  { name: "Discover", type: "credit", balance: 205.37, csv: "Trans. Date,Post Date,Description,Amount,Category\n10/02/2026,10/03/2026,BUTCHERBOX,160.00,Supermarkets\n10/04/2026,10/05/2026,RALEYS #112 RENO NV,61.37,Supermarkets\n10/07/2026,10/07/2026,SPOTIFY USA,14.00,Services\n10/08/2026,10/08/2026,INTERNET PAYMENT - THANK YOU,-150.00,Payments and Credits\n10/11/2026,10/12/2026,GREAT BASIN BREWING CO,27.40,Restaurants\n10/13/2026,10/14/2026,CHEVRON 0092 RENO NV,41.20,Gasoline\n10/15/2026,10/16/2026,AMAZON MKTPL*2K4LM1,23.47,Merchandise\n10/16/2026,10/16/2026,WINCO FOODS #45,37.90,Supermarkets\n" },
+  { name: "Bank of America card", type: "credit", balance: 33.09, csv: "Posted Date,Reference Number,Payee,Address,Amount\n10/03/2026,24692166277100105884917,APPLE.COM/BILL,866-712-7753 CA,-4.99\n10/09/2026,24445006282102838191039,TARGET 00012 RENO NV,RENO NV,-18.62\n10/14/2026,24210736287800041113402,WALGREENS #3221,RENO NV,-9.48\n" },
+  { name: "High-yield savings", type: "savings", balance: 6140.00 },
+  { name: "Roth IRA", type: "investment", balance: 4870.30 },
+  { name: "Stocks", type: "investment", balance: 2215.10 },
+];
 
 // =====================================================================
 // WAR CHEST 2. SAVING AND LOADING (this browser only, like the habit log)
@@ -5459,6 +5668,45 @@ const finDayName = (key) => FIN_MONTHS[Number(key.slice(5, 7)) - 1] + " " + key.
 const finId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 
 let finMonth = monthOf(todayKey());   // the month the budget is showing
+let finPicking = null;                 // the Incoming line whose full category list is open
+
+// Suggested budget line for an Incoming charge. A card payment goes to that card's own line.
+function finSuggestFor(t) {
+  if (t.kind === "cardpay") {
+    const card = fin.accounts.find((a) => a.id === t.to);
+    const words = card ? card.name.toUpperCase().split(/\s+/).filter((w) => w.length > 2 && w !== "CARD") : [];
+    const line = fin.categories.find((c) => words.some((w) => c.name.toUpperCase().includes(w)));
+    if (line) return line.id;
+  }
+  return finSuggest(t.desc, t.amount, fin);
+}
+
+// File an Incoming line. Spending becomes an expense on its budget line;
+// a transfer to savings checks off that payday's transfer instead.
+function finFile(t, catId) {
+  if (t.kind === "deposit" || t.kind === "tithe") {
+    const fund = finFundFor(t, fin), pd = finPrevPayday(t.date, fin.paydays);
+    if (fund) { fin.payday[pd] = fin.payday[pd] || {}; fin.payday[pd][fund] = true; }
+  } else {
+    const exp = { id: finId(), date: t.date, cat: catId, amount: finRound(-t.amount), note: t.desc, from: t.id };
+    fin.expenses.push(exp);
+    t.expId = exp.id; t.cat = catId;
+    fin.rules[finMerchantKey(t.desc)] = catId;   // remember it for next time
+  }
+  t.done = true;
+  finPicking = null;
+  // Everything sorted? That counts as today's Finance habit.
+  if (!fin.incoming.some((x) => !x.done)) finMarkFinanceHabit();
+}
+function finUnfile(t) {
+  if (t.kind === "deposit" || t.kind === "tithe") {
+    const fund = finFundFor(t, fin), pd = finPrevPayday(t.date, fin.paydays);
+    if (fund && fin.payday[pd]) delete fin.payday[pd][fund];
+  } else {
+    fin.expenses = fin.expenses.filter((e) => e.id !== t.expId);
+  }
+  Object.assign(t, { done: false, cat: null, expId: null });
+}
 
 // =====================================================================
 // WAR CHEST 4. DRAW THE SCREEN
@@ -5554,6 +5802,43 @@ function renderFinance() {
   });
   finEl("fin-txs").innerHTML = html || `<div class="note">Nothing logged for ${finMonthName(finMonth)} yet.</div>`;
 
+  // ----- incoming: unsorted lines first (oldest on top), this month's sorted ones below -----
+  const acctName = (id) => (fin.accounts.find((a) => a.id === id) || { name: "?" }).name;
+  const todo = fin.incoming.filter((t) => !t.done).sort((a, b) => a.date.localeCompare(b.date));
+  const filed = fin.incoming.filter((t) => t.done && monthOf(t.date) === finMonth).sort((a, b) => b.date.localeCompare(a.date));
+  finEl("fin-inc-count").textContent = todo.length ? `${todo.length} TO SORT` : fin.incoming.length ? "ALL SORTED ✓" : "";
+  finEl("fin-sample").textContent = fin.incoming.some((t) => t.sample) ? "CLEAR SAMPLE" : "LOAD SAMPLE";
+  const incRow = (t) => {
+    const catName = (id) => (fin.categories.find((c) => c.id === id) || { name: "?" }).name;
+    const isMove = t.kind === "deposit" || t.kind === "tithe";
+    // Money moved to your own savings shows as + to that account, not − from checking
+    const title = isMove ? (t.kind === "tithe" ? "Tithing" : "To " + acctName(t.to)) : t.desc;
+    const sub = isMove ? `${finDayName(t.date)} · FROM ${acctName(t.acct)}` : `${finDayName(t.date)} · ${acctName(t.acct)}${t.kind === "cardpay" ? " · CARD PAYMENT" : ""}`;
+    const amount = isMove ? `<span class="money up">+${finMoney(-t.amount, true)}</span>` : `<span class="money">−${finMoney(-t.amount, true)}</span>`;
+    const sug = isMove ? null : finSuggestFor(t);
+    let rowAttr, chips;
+    if (t.done) {
+      rowAttr = `data-inc-undo="${t.id}"`;
+      chips = `<button class="chip picked" type="button" data-inc-undo="${t.id}">${isMove ? "PAYDAY ORDER ✓" : finEsc(catName(t.cat)).toUpperCase()} · UNDO</button>`;
+    } else if (isMove) {
+      rowAttr = `data-inc-pick="${t.id}"`;
+      chips = `<button class="chip suggest" type="button" data-inc-pick="${t.id}">CONFIRM ✓</button>`;
+    } else if (finPicking === t.id) {
+      rowAttr = `data-inc-open="${t.id}"`;
+      chips = fin.categories.map((c) => `<button class="chip" type="button" data-inc-pick="${t.id}" data-inc-cat="${c.id}">${finEsc(c.name).toUpperCase()}</button>`).join("");
+    } else {
+      rowAttr = sug ? `data-inc-pick="${t.id}" data-inc-cat="${sug}"` : `data-inc-open="${t.id}"`;
+      chips = (sug ? `<button class="chip suggest" type="button" data-inc-pick="${t.id}" data-inc-cat="${sug}">${finEsc(catName(sug)).toUpperCase()} ✓</button>` : "")
+            + `<button class="chip" type="button" data-inc-open="${t.id}">${sug ? "OTHER ›" : "SORT INTO… ›"}</button>`;
+    }
+    return `<div class="inc ${t.done ? "done" : ""}">
+      <button class="row ${t.done ? "on" : ""}" type="button" ${rowAttr}><span class="box"></span>
+        <span class="who"><div>${finEsc(title)}</div><div class="tag">${finEsc(sub).toUpperCase()}</div></span>${amount}</button>
+      <div class="chips">${chips}</div></div>`;
+  };
+  finEl("fin-incoming").innerHTML = todo.concat(filed).map(incRow).join("")
+    || `<div class="note">Nothing waiting. Import a statement from your bank (or load the sample) and each charge shows up here to sort.</div>`;
+
   // ----- accounts -----
   const FIN_ICO = { checking: "CHK", savings: "SAV", credit: "CC", investment: "INV" };
   finEl("fin-accts").innerHTML = fin.accounts.map((a) => `
@@ -5580,6 +5865,15 @@ finEl("fin-m-next").onclick = () => { finMonth = finAddMonths(finMonth, 1); rend
 
 // One listener for every tappable row (they're redrawn often, so we listen on the whole screen)
 finEl("fin-view").addEventListener("click", (ev) => {
+  // Incoming: file a line (suggested or picked), open the full list, or undo
+  const pick = ev.target.closest("[data-inc-pick]"), open = ev.target.closest("[data-inc-open]"), undo = ev.target.closest("[data-inc-undo]");
+  const incItem = (el, attr) => fin.incoming.find((t) => t.id === el.getAttribute(attr));
+  if (pick || open || undo) {
+    if (pick) finFile(incItem(pick, "data-inc-pick"), pick.getAttribute("data-inc-cat"));
+    else if (open) finPicking = finPicking === open.getAttribute("data-inc-open") ? null : open.getAttribute("data-inc-open");
+    else finUnfile(incItem(undo, "data-inc-undo"));
+    saveFinance(); renderFinance(); return;
+  }
   const order = ev.target.closest("[data-order]");
   if (order) {                                   // check off a payday transfer
     const pd = finNextPayday(todayKey(), fin.paydays);
@@ -5640,6 +5934,8 @@ finEl("dlg-exp").addEventListener("close", () => {
   if (choice === "delete" && finEditExp) {
     if (!confirm("Delete this expense?")) return;
     fin.expenses = fin.expenses.filter((e) => e !== finEditExp);
+    const src = fin.incoming.find((t) => t.expId === finEditExp.id);   // came from Incoming? put it back to sort
+    if (src) Object.assign(src, { done: false, cat: null, expId: null });
   } else if (choice === "save") {
     const data = { date: finEl("exp-date").value, cat: finEl("exp-cat").value, amount: finRound(Number(finEl("exp-amt").value)), note: finEl("exp-note").value.trim() };
     if (!(data.amount > 0) || !data.date) return;
@@ -5662,6 +5958,42 @@ function finOpenAccount(acct) {
   finEl("dlg-acct").showModal();
 }
 finEl("fin-add-acct").onclick = () => finOpenAccount(null);
+
+// ----- import a statement -----
+finEl("fin-import").onclick = () => {
+  if (!fin.accounts.length) return alert("Add your accounts on the Net Worth tab first, so the app knows which account a statement is from.");
+  finEl("imp-acct").innerHTML = fin.accounts.map((a) => `<option value="${a.id}">${finEsc(a.name)}</option>`).join("");
+  finEl("imp-file").value = "";
+  finEl("dlg-imp").showModal();
+};
+finEl("dlg-imp").addEventListener("close", async () => {
+  const file = finEl("imp-file").files[0];
+  if (finEl("dlg-imp").returnValue !== "save" || !file) return;
+  try {
+    const added = finAddStatement(fin, finEl("imp-acct").value, await file.text(), finId, false);
+    saveFinance(); renderFinance();
+    alert(added ? `${added} new line${added === 1 ? "" : "s"} to sort.` : "Nothing new in that file.");
+  } catch (error) { alert(error.message); }
+});
+
+// ----- sample statements: load them, or clear everything they added -----
+finEl("fin-sample").onclick = () => {
+  if (fin.incoming.some((t) => t.sample)) {
+    if (!confirm("Remove the sample statements, the sample accounts, and anything you sorted from them?")) return;
+    const ids = new Set(fin.incoming.filter((t) => t.sample).map((t) => t.expId));
+    fin.expenses = fin.expenses.filter((e) => !ids.has(e.id));
+    fin.incoming = fin.incoming.filter((t) => !t.sample);
+    fin.accounts = fin.accounts.filter((a) => !a.sample);
+  } else {
+    FIN_SAMPLE.forEach((s) => {
+      let acct = fin.accounts.find((a) => a.name === s.name);
+      if (!acct) { acct = { id: finId(), name: s.name, type: s.type, balance: s.balance, sample: true }; fin.accounts.push(acct); }
+    });
+    FIN_SAMPLE.filter((s) => s.csv).forEach((s) => finAddStatement(fin, fin.accounts.find((a) => a.name === s.name).id, s.csv, finId, true));
+    finMonth = "2026-10";
+  }
+  saveFinance(); renderFinance();
+};
 finEl("dlg-acct").addEventListener("close", () => {
   const choice = finEl("dlg-acct").returnValue;
   if (choice === "delete" && finEditAcct) {
@@ -5675,6 +6007,12 @@ finEl("dlg-acct").addEventListener("close", () => {
   } else return;
   saveFinance(); renderFinance();
 });
+
+// Incoming all sorted -> check off today's Finance habit (only adds a check, never removes one).
+function finMarkFinanceHabit() {
+  const day = todayKey();
+  if (!isDone("finance", day)) toggle("finance", day);
+}
 
 
 // render() draws ALL screens. toggle() already calls render(),
