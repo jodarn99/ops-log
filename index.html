@@ -2117,9 +2117,10 @@ const DEFAULT_HABITS = [
   { id: "fishing",   name: "Fishing",             category: "outdoor" },
   { id: "hunting",   name: "Hunting",             category: "outdoor" },
   { id: "hiking",    name: "Hiking",              category: "outdoor" },
-  // Celebrate Recovery is a monthly op: it counts with the field outings,
-  // toward one combined monthly target.
-  { id: "cr",        name: "Celebrate Recovery",  short: "Celeb. Rec.", category: "outdoor" },
+  // Celebrate Recovery is a monthly op with its OWN target (ownTarget):
+  // 4 meetings a month, scored as its own line. The field outings above
+  // share the pooled target, settings.outdoorTarget.
+  { id: "cr",        name: "Celebrate Recovery",  short: "Celeb. Rec.", category: "outdoor", ownTarget: 4 },
 ];
 
 const TRACK_START = "2026-10-11";   // first day of the campaign
@@ -2176,7 +2177,7 @@ const SETTINGS_KEY = "opslog-stage1-settings";
 const DEFAULT_SETTINGS = {
   name: "",                  // shown with your rank
   habits: DEFAULT_HABITS,    // the starting list, used the very first time
-  outdoorTarget: 8,          // monthly ops per month, all monthly habits combined
+  outdoorTarget: 4,          // field ops per month, shared by monthly habits without their own target
   weights: { daily: 0.60, weekly: 0.25, outdoor: 0.15 },   // see THE SCORE CHAIN
   theme: "auto",             // "auto" = follow the month, or a month like "2027-03"
   motion: "system",          // "system", "reduce" or "full"
@@ -2198,10 +2199,22 @@ function mergeSettings(saved) {
 
 function loadSettings() {
   try {
-    return mergeSettings(JSON.parse(localStorage.getItem(SETTINGS_KEY)));
+    return splitCR(mergeSettings(JSON.parse(localStorage.getItem(SETTINGS_KEY))));
   } catch (error) {
     return mergeSettings();
   }
+}
+
+// One-time update (Oct 18, 2026): Celebrate Recovery used to share one
+// pool of 8 with the field outings. Now it's its own line, 4 a month, and
+// the outings pool is 4. Saved settings from before get the same change
+// once; `crSplit` remembers it's done, so a target you change later stays.
+function splitCR(s) {
+  if (s.crSplit) return s;
+  s.habits = s.habits.map((h) => (h.id === "cr" && !h.ownTarget ? { ...h, ownTarget: 4 } : h));
+  if (s.outdoorTarget === 8) s.outdoorTarget = 4;
+  s.crSplit = true;
+  return s;
 }
 
 function saveSettings() {
@@ -2396,12 +2409,11 @@ function scoresFor(day) {
   const drills = weekly;
   const drillsMet = drills.filter((h) => countBetween([h.id], weekStart, weekEnd) >= h.target).length;
 
-  // MISSION: monthly ops this month, all four combined.
+  // MISSION: monthly ops this month, every line (field ops pool, CR, ...).
   const month = monthOf(day);
-  const outdoorIds = outdoor.map((h) => h.id);
-  const missionCount = logs.filter((log) => outdoorIds.includes(log.habit) && monthOf(log.date) === month).length;
+  const mission = opsStatus(month + "-01", monthEnd(month), 1);
 
-  return { daily, weekly, outdoor, drills, dailyDone, readiness, optempo, drillsMet, weekStart, weekEnd, month, missionCount };
+  return { daily, weekly, outdoor, drills, dailyDone, readiness, optempo, drillsMet, weekStart, weekEnd, month, mission };
 }
 
 // WEEKLY PART for one stretch of days, 0–100. Each weekly goal gets an
@@ -2445,11 +2457,40 @@ function stretchScore(from, to) {
   return { from, to, days, daily, weekly, score };
 }
 
-// MONTHLY OPS: every monthly habit counted together against settings.outdoorTarget.
-// `due` is the share of the target the days so far call for. Capped at 100%.
-function opsRaw(count, due) {
-  if (!activeHabits().some((h) => h.category === "outdoor")) return null;
-  return Math.min(100, (count / due) * 100);
+// MONTHLY OPS LINES. A monthly habit with its own target (ownTarget, like
+// Celebrate Recovery's 4) is a line of its own. Every other monthly habit
+// (fishing, hunting, hiking) goes in one shared pool, the "Field ops" line,
+// with the target settings.outdoorTarget.
+function opsLines() {
+  const outdoor = activeHabits().filter((h) => h.category === "outdoor");
+  const pooled = outdoor.filter((h) => !h.ownTarget);
+  const lines = outdoor.filter((h) => h.ownTarget)
+    .map((h) => ({ name: h.short || h.name, ids: [h.id], target: h.ownTarget }));
+  if (pooled.length > 0) lines.unshift({ name: "Field ops", ids: pooled.map((h) => h.id), target: settings.outdoorTarget });
+  return lines;
+}
+
+// MONTHLY OPS score for a stretch of a month, 0–100 (null with no monthly
+// habits). Like the weekly drills, each line is an EQUAL share, capped at
+// 100%, so extra fishing can't cover a missed CR meeting.
+// `share` is how much of the target the days so far call for: 10 days into
+// a 31-day month expects CR 4 × 10/31 ≈ 1.3 meetings.
+function opsStatus(from, to, share) {
+  const lines = opsLines().map((line) => {
+    const count = countBetween(line.ids, from, to);
+    const due = line.target * share;
+    return { ...line, count, due, pct: Math.min(100, (count / due) * 100), met: count >= line.target };
+  });
+  const sum = (key) => lines.reduce((total, line) => total + line[key], 0);
+  return {
+    lines,
+    count: sum("count"),                                                 // every check-off
+    done: lines.reduce((t, l) => t + Math.min(l.count, l.target), 0),   // check-offs that count (capped)
+    target: sum("target"),                                               // 4 + 4 = 8
+    due: sum("due"),
+    pct: lines.length ? sum("pct") / lines.length : null,
+    met: lines.length > 0 && lines.every((line) => line.met),            // every line hit its target
+  };
 }
 
 // =====================================================================
@@ -2573,11 +2614,11 @@ function renderToday() {
   renderWeek(s.weekStart);
 
   // Score tiles
-  const missionMet = s.missionCount >= settings.outdoorTarget;
+  const missionMet = s.mission.met;
   document.getElementById("tiles").innerHTML =
     tile("READINESS", pct(s.readiness), `${s.dailyDone}/${s.daily.length} today`, false) +
     tile("OPTEMPO", pct(s.optempo), `${s.drillsMet}/${s.drills.length} drills met`, false) +
-    tile("MISSION", `${s.missionCount}/${settings.outdoorTarget}`, missionMet ? "OBJECTIVE MET" : "monthly ops", missionMet);
+    tile("MISSION", `${s.mission.done}/${s.mission.target}`, missionMet ? "OBJECTIVE MET" : "monthly ops", missionMet);
 
   // Daily orders
   const dailyList = document.getElementById("daily-list");
@@ -2592,13 +2633,16 @@ function renderToday() {
   }));
   document.getElementById("week-range").textContent = `${prettyDay(s.weekStart).slice(4)} – ${prettyDay(s.weekEnd).slice(4)}`;
 
-  // Monthly ops: each outdoor habit's count this month
+  // Monthly ops: each outdoor habit's count this month. A habit with its
+  // own target shows count/target; pooled ones just show their count.
   const outdoorList = document.getElementById("outdoor-list");
   outdoorList.replaceChildren(...openFirst(s.outdoor).map((h) => {
     const count = logs.filter((log) => log.habit === h.id && monthOf(log.date) === s.month).length;
-    return habitRow(h, `${count} this mo`);
+    return habitRow(h, h.ownTarget ? `${count}/${h.ownTarget} mo` : `${count} this mo`);
   }));
-  document.getElementById("month-count").textContent = `${s.missionCount}/${settings.outdoorTarget} combined`;
+  // Header: each line's progress, like "Field ops 2/4 · Celeb. Rec. 1/4".
+  document.getElementById("month-count").textContent =
+    s.mission.lines.map((line) => `${line.name} ${line.count}/${line.target}`).join(" · ");
 }
 
 // =====================================================================
@@ -2715,7 +2759,8 @@ function monthEnd(month) {
 //   WEEK  = the week's days (its daily part) + its weekly goals.
 //           Every weekly goal is 1/x of the weekly part, capped at 100%.
 //   MONTH = the month's weeks (averaged by their days) + the monthly ops
-//           (field goals: fishing, hunting, hiking, Celebrate Recovery).
+//           (field ops: fishing, hunting, hiking together; Celebrate
+//           Recovery on its own line; each line an equal share).
 //   YEAR  = the average of its months.
 //
 // The shares come from settings.weights (60 / 25 / 15 to start):
@@ -2804,13 +2849,12 @@ function monthScores(month, asOf) {
   const readiness = byDays("daily");    // the daily part, for reference
   const optempo = byDays("weekly");     // the weekly part, for reference
 
-  // 2. MONTHLY OPS (field goals): all of them counted together. Mid-month
-  //    you aren't expected to have all 8 yet, so the target grows with the
-  //    days passed: 10 days into a 31-day month expects 8 × 10/31 ≈ 2.6.
-  const outdoorIds = activeHabits().filter((h) => h.category === "outdoor").map((h) => h.id);
-  const missionCount = countBetween(outdoorIds, month + "-01", monthEnd(month));
-  const missionDue = settings.outdoorTarget * (days / monthDays);
-  const ops = opsRaw(missionCount, missionDue);
+  // 2. MONTHLY OPS: the field ops pool and Celebrate Recovery, each an
+  //    equal share (see opsStatus). Mid-month you aren't expected to have
+  //    all 4 yet, so each target grows with the days passed:
+  //    10 days into a 31-day month expects 4 × 10/31 ≈ 1.3.
+  const mission = opsStatus(month + "-01", monthEnd(month), days / monthDays);
+  const ops = mission.pct;
 
   // 3. MONTH = weeks × 85% + monthly ops × 15%. Hit everything = 100%.
   const statusRaw = blend([
@@ -2827,7 +2871,7 @@ function monthScores(month, asOf) {
     weeks, days, monthDays,
     status: round(statusRaw), statusRaw, earned: round(earnedRaw), earnedRaw,
     weeksAvg: round(weeksAvg), readiness: round(readiness), optempo: round(optempo),
-    missionCount, missionDue, missionPct: round(ops), monthlyPct: round(ops),
+    mission, missionCount: mission.count, missionDue: mission.due, missionPct: round(ops), monthlyPct: round(ops),
   };
 }
 
@@ -2967,13 +3011,13 @@ function renderHq() {
 
     const stats = el("div", "stats");
     if (s) {
-      const missionMet = s.missionCount >= settings.outdoorTarget;
+      const missionMet = s.mission.met;
       stats.innerHTML =
         `<span>PACE <b class="${statusClass(s.status)}">${s.status}%</b></span>` +
         `<span>WEEKS <b>${pct(s.weeksAvg)}</b></span>` +
         `<span>READINESS <b>${pct(s.readiness)}</b></span>` +
         `<span>OPTEMPO <b>${pct(s.optempo)}</b></span>` +
-        `<span>MISSION <b class="${missionMet ? "good" : ""}">${s.missionCount}/${settings.outdoorTarget}</b></span>` +
+        `<span>MISSION <b class="${missionMet ? "good" : ""}">${s.mission.done}/${s.mission.target}</b></span>` +
         (isFiled(`month:${month}`) ? `<span class="filed">AAR FILED</span>` : "");
     } else {
       stats.textContent = "Not started";
@@ -3199,7 +3243,9 @@ function breakdown(s, from, to, mode) {
       parts.push(brkRow(label, round(w.score ?? 0), `${w.days} d`));
     }
     parts.push(brkGroup("MONTHLY OPS", monthShares().ops / monthTotal, s.missionPct, "MONTH"));
-    parts.push(brkRow("Monthly ops", s.missionPct ?? 0, `${s.missionCount}/${settings.outdoorTarget} · ${s.missionDue.toFixed(1)} due`));
+    for (const line of s.mission.lines) {
+      parts.push(brkRow(line.name, round(line.pct), `${line.count}/${line.target} · ${line.due.toFixed(1)} due`));
+    }
     parts.push(opsLine());
     parts.push(brkTotal("MONTH SCORE", s.status, `pace · ${s.earned}% earned`));
     // Inside the weeks: every habit, to see what moved the score.
@@ -3361,7 +3407,7 @@ function renderReview() {
     next.disabled = reviewMonth >= monthOf(today);
     document.getElementById("review-q-title").textContent = "// AFTER ACTION REVIEW";
     document.getElementById("review-legend").textContent =
-      `Month score = its weeks ${chainShares().weeks}% (averaged by their days) + monthly ops ${chainShares().ops}% (${settings.outdoorTarget} a month, all monthly habits combined; the target grows with the days passed). The year is the average of its months.`;
+      `Month score = its weeks ${chainShares().weeks}% (averaged by their days) + monthly ops ${chainShares().ops}% (${opsLines().map((line) => `${line.name} ${line.target}`).join(" + ")} a month, each an equal share; the targets grow with the days passed). The year is the average of its months.`;
   }
 
   document.getElementById("review-questions").replaceChildren(
@@ -3820,11 +3866,13 @@ function computeStats() {
     if (!s) break;   // this month and the rest haven't started
     const finished = monthEnd(month) < today;
     const first = month + "-01" < TRACK_START ? TRACK_START : month + "-01";
-    const opsLeft = finished ? 0 : (daysBetween(today, monthEnd(month)) - 1) * outdoor.length;
-    monthOk[month] = outdoor.length === 0 || s.missionCount + opsLeft >= settings.outdoorTarget;
+    // Every monthly ops line must be met, or still reachable (one check-off
+    // a day per habit in the line).
+    const daysLeft = finished ? 0 : daysBetween(today, monthEnd(month)) - 1;
+    monthOk[month] = s.mission.lines.every((line) => line.count + daysLeft * line.ids.length >= line.target);
 
     if (finished && s.statusRaw >= 99.95) perfectMonths += 1;
-    if (s.missionCount >= settings.outdoorTarget) objectives += 1;
+    if (s.mission.met) objectives += 1;
     if (finished) {
       const hit90 = reaches(s.statusRaw, 90);
       if (hit90) months90 += 1;
@@ -4373,7 +4421,8 @@ function renderRankPanel() {
 
 // ---------- DAILY ORDERS panel: your habits ----------
 // Frequency on screen → category in the data. "Monthly" habits are the
-// monthly ops (category "outdoor"), counted together toward one target.
+// monthly ops (category "outdoor"): they share the field ops target, unless
+// they have their own (ownTarget, the /MO box).
 const FREQUENCIES = [["daily", "DAILY"], ["weekly", "WEEKLY"], ["outdoor", "MONTHLY"]];
 const FREQ_TITLES = { daily: "// DAILY", weekly: "// WEEKLY", outdoor: "// MONTHLY OPS" };
 
@@ -4430,6 +4479,14 @@ function renderHabitEditor() {
         line2.append(
           numberInput(habit.target || 1, 1, 7, `${habit.name} per week`, (n) => updateHabit(habit.id, { target: n })),
           el("span", "per", "/WK")
+        );
+      }
+      // Monthly habits: 0 = shares the field ops pool, 1+ = its own line.
+      if (habit.category === "outdoor") {
+        line2.append(
+          numberInput(habit.ownTarget || 0, 0, 31, `${habit.name} own monthly target`,
+            (n) => updateHabit(habit.id, { ownTarget: n || undefined })),
+          el("span", "per", "/MO")
         );
       }
       line2.append(smallButton(retired ? "RESTORE" : "RETIRE", `${retired ? "Restore" : "Retire"} ${habit.name}`,
@@ -4496,9 +4553,9 @@ function renderGoalEditor() {
 
   const c = chainShares();
   document.getElementById("goal-editor").replaceChildren(
-    field("Monthly ops per month", numberInput(settings.outdoorTarget, 1, 60, "Monthly ops per month",
+    field("Field ops per month", numberInput(settings.outdoorTarget, 1, 60, "Field ops per month",
       (n) => { settings.outdoorTarget = n; commitSettings(); })),
-    el("div", "note pad", "Every monthly habit counts toward this one combined target."),
+    el("div", "note pad", "Monthly habits with /MO set to 0 share this target. One with its own /MO (like Celebrate Recovery, 4) is its own line. Each line is an equal share of monthly ops."),
     ...weightRows,
     message,
     el("div", "note pad", `So a week = days ${c.day}% + drills ${c.drills}%, and a month = weeks ${c.weeks}% + monthly ops ${c.ops}%.`)
@@ -4999,7 +5056,7 @@ function restoreBackup(data) {
   logs = data.logs;
   reviews = data.reviews || {};
   awards = data.awards || {};
-  settings = mergeSettings(data.settings);
+  settings = splitCR(mergeSettings(data.settings));   // an older backup gets the CR split too
   saveLogs();
   saveReviews();
   saveAwards();
