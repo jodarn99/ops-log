@@ -2435,26 +2435,24 @@ function drillScore(from, to, share) {
   return round(drillRaw(from, to, share));
 }
 
-// DAILY PART for a stretch: the average of its days' scores. (Same as
-// check-offs ÷ (daily habits × days), which is quicker to count.)
+// DAILY PART for a stretch: the average of its days' scores (dayRaw).
 function dailyAvg(from, to) {
-  const ids = activeHabits().filter((h) => h.category === "daily").map((h) => h.id);
-  if (ids.length === 0) return null;
-  return (countBetween(ids, from, to) / (ids.length * daysBetween(from, to))) * 100;
+  if (activeHabits().every((h) => h.category !== "daily")) return null;
+  let sum = 0;
+  for (let day = from; day <= to; day = addDays(day, 1)) sum += dayRaw(day);
+  return sum / daysBetween(from, to);
 }
 
-// WEEK: one Sun–Sat week, or the piece of it inside a month or up to
-// today. Short pieces get prorated weekly targets (3 days = 3/7 of each).
-// WEEK = daily part × 60/85 + weekly part × 25/85.
+// WEEK: one Sun–Sat week (up to today while it's still going).
+// WEEK SCORE = the average of its days. 85% every day = an 85% week.
+// The week's drills are worked out here too (`weekly`), but they count
+// in the MONTH, not in the week. A week still going expects drills for
+// the days so far (3 days = 3/7 of each target).
 function stretchScore(from, to) {
   const days = daysBetween(from, to);
   const daily = dailyAvg(from, to);
   const weekly = drillRaw(from, to, days / 7);
-  const score = blend([
-    { score: daily, weight: weekShares().daily },
-    { score: weekly, weight: weekShares().weekly },
-  ]);
-  return { from, to, days, daily, weekly, score };
+  return { from, to, days, daily, weekly, score: daily };
 }
 
 // MONTHLY OPS LINES. A monthly habit with its own target (ownTarget, like
@@ -2666,13 +2664,21 @@ function el(tag, className, text) {
   return node;
 }
 
-// DAY: the share of your daily orders done that day, 0–100. Each daily
-// habit is 1/x of the day. null if you have no daily habits at all.
+// DAY: 0–100. Nothing done = 0%. The FIRST habit done = 50%, and every
+// habit after it adds the same step, up to 100% with all of them done.
+// With 11 daily habits each step is 50 ÷ 10 = 5%: 1 = 50%, 2 = 55%,
+// 8 = 85%, 11 = 100%. (Jordan's rule, 2026-10-26.) null if you have no
+// daily habits at all.
+function dayFromCount(done, total) {
+  if (total === 0) return null;
+  if (done === 0) return 0;
+  if (total === 1) return 100;                     // one habit: done = all done
+  return 50 + (50 * (done - 1)) / (total - 1);
+}
 function dayRaw(day) {
   const daily = activeHabits().filter((h) => h.category === "daily");
-  if (daily.length === 0) return null;
   const done = daily.filter((h) => isDone(h.id, day)).length;
-  return (done / daily.length) * 100;
+  return dayFromCount(done, daily.length);
 }
 function dayScore(day) {
   return round(dayRaw(day));
@@ -2754,43 +2760,34 @@ function monthEnd(month) {
 // =====================================================================
 // THE SCORE CHAIN:  DAY → WEEK → MONTH → YEAR
 //
-//   DAY   = daily habits done ÷ how many daily habits you have.
-//           Every daily habit is 1/x of the day, whatever x is.
-//   WEEK  = the week's days (its daily part) + its weekly goals.
-//           Every weekly goal is 1/x of the weekly part, capped at 100%.
-//   MONTH = the month's weeks (averaged by their days) + the monthly ops
-//           (field ops: fishing, hunting, hiking together; Celebrate
-//           Recovery on its own line; each line an equal share).
+//   DAY   = nothing done 0%, first habit 50%, then equal steps to 100%.
+//   WEEK  = the average of its 7 days (Sun–Sat). Weeks are never cut at
+//           a month's edge: a week belongs to the month holding most of
+//           its days (the month its Wednesday is in).
+//   MONTH = its weeks (every week counts the same) + its weekly drills
+//           (each week's drills, averaged; every drill an equal share,
+//           capped at 100%) + the monthly ops (field ops pool and
+//           Celebrate Recovery, each line an equal share).
 //   YEAR  = the average of its months.
 //
-// The shares come from settings.weights (60 / 25 / 15 to start):
-//   inside a week:  daily 60 : weekly 25  →  70.6% / 29.4% of the week
-//   inside a month: weeks 85 : ops 15     →  85% / 15% of the month
-// so a month still works out to daily 60 · weekly 25 · ops 15 overall.
-// Add or remove habits and every level still tops out at exactly 100%.
-// A level with NO habits in it (say, zero weekly goals) passes its share
+// The month's shares come from settings.weights (60 / 25 / 15 to start):
+//   weeks 60 · drills 25 · monthly ops 15. Hit everything = 100%.
+// A part with NO habits in it (say, zero weekly goals) passes its share
 // to the others instead of counting as a zero.
 // =====================================================================
 // The weights live in settings.weights, so Settings → Goals & Scoring can
-// change them. These read them fresh every time.
-function weekShares() {
-  const w = settings.weights;
-  return { daily: w.daily, weekly: w.weekly };                    // 60 : 25
-}
+// change them. This reads them fresh every time.
 function monthShares() {
   const w = settings.weights;
-  return { weeks: w.daily + w.weekly, ops: w.outdoor };           // 85 : 15
+  return { weeks: w.daily, drills: w.weekly, ops: w.outdoor };    // 60 : 25 : 15
 }
 
-// The chain's shares as percents for labels: { day: 70.6, drills: 29.4, weeks: 85, ops: 15 }
+// The month's shares as percents for labels: { weeks: 60, drills: 25, ops: 15 }
 function chainShares() {
-  const wk = weekShares();
-  const mo = monthShares();
-  const one = (part, whole) => (whole ? Math.round((part / whole) * 1000) / 10 : 0);
-  return {
-    day: one(wk.daily, wk.daily + wk.weekly), drills: one(wk.weekly, wk.daily + wk.weekly),
-    weeks: one(mo.weeks, mo.weeks + mo.ops), ops: one(mo.ops, mo.weeks + mo.ops),
-  };
+  const m = monthShares();
+  const total = m.weeks + m.drills + m.ops;
+  const one = (part) => (total ? Math.round((part / total) * 1000) / 10 : 0);
+  return { weeks: one(m.weeks), drills: one(m.drills), ops: one(m.ops) };
 }
 
 // Mix scores by weight. A part whose score is null (no habits of that
@@ -2812,15 +2809,37 @@ function round(n) {
 // month keys straight out of the OPERATIONS list.
 const MONTHS = Object.keys(OPERATIONS);
 
-// The days of a month that count so far: never before Oct 11, never after today.
-// Returns null for a month that hasn't started yet.
+// The last day of the campaign (Dec 31, 2027).
+function campaignEnd() {
+  return monthEnd(MONTHS[MONTHS.length - 1]);
+}
+
+// A month's WEEKS: every Sun–Sat week whose Wednesday is in the month, so
+// each week belongs to exactly one month (the one with most of its days).
+// Nov 29 – Dec 5, 2026 belongs to December. Weeks before Oct 11 are skipped.
+// Each comes back as { start, first, end }: first/end are the week's days
+// inside the campaign (Oct 11 to Dec 31, 2027).
+function monthWeeks(month) {
+  const weeks = [];
+  for (let ws = weekStartKey(month + "-01"); ws <= monthEnd(month); ws = addDays(ws, 7)) {
+    if (monthOf(addDays(ws, 3)) !== month) continue;         // its Wednesday is in another month
+    const first = ws < TRACK_START ? TRACK_START : ws;
+    const end = addDays(ws, 6) > campaignEnd() ? campaignEnd() : addDays(ws, 6);
+    if (first <= end) weeks.push({ start: ws, first, end });
+  }
+  return weeks;
+}
+
+// The days of a month's weeks that count so far (never after today).
+// Returns null for a month whose first week hasn't started yet.
 // `asOf` (optional) reads the month as it stood on an earlier day.
 function scoredRange(month, asOf = todayKey()) {
-  const first = month + "-01" < TRACK_START ? TRACK_START : month + "-01";
-  const end = monthEnd(month);
-  const today = asOf;
-  const last = end < today ? end : today;
-  return first <= last ? { first, last } : null;
+  const weeks = monthWeeks(month);
+  if (weeks.length === 0) return null;
+  const first = weeks[0].first;
+  const end = weeks[weeks.length - 1].end;
+  const last = end < asOf ? end : asOf;
+  return first <= last ? { first, last, end } : null;
 }
 
 // How many days from a to b, counting both ends. 86400000 = ms in a day.
@@ -2828,38 +2847,39 @@ function daysBetween(a, b) {
   return Math.round((parseKey(b) - parseKey(a)) / 86400000) + 1;
 }
 
-function monthScores(month, asOf) {
+function monthScores(month, asOf = todayKey()) {
   const range = scoredRange(month, asOf);
   if (!range) return null;   // upcoming month: nothing to score yet
-  const days = daysBetween(range.first, range.last);
-  const monthDays = daysBetween(range.first, monthEnd(month));
 
-  // 1. THE WEEKS. Each Sun–Sat week is cut to the month's edges (and to
-  //    today) and scored with stretchScore. They're averaged by their
-  //    days, so a full 7-day week counts 7× as much as a 1-day sliver.
-  const weeks = [];
-  for (let ws = weekStartKey(range.first); ws <= range.last; ws = addDays(ws, 7)) {
-    const from = ws < range.first ? range.first : ws;
-    const we = addDays(ws, 6);
-    weeks.push(stretchScore(from, we > range.last ? range.last : we));
-  }
-  const byDays = (key) =>
-    weeks[0][key] === null ? null : weeks.reduce((sum, w) => sum + w[key] * w.days, 0) / days;
-  const weeksAvg = byDays("score");
-  const readiness = byDays("daily");    // the daily part, for reference
-  const optempo = byDays("weekly");     // the weekly part, for reference
+  // 1. THE WEEKS that have started, each scored up to today. Every week
+  //    counts the same, whole or still going.
+  const weeks = monthWeeks(month)
+    .filter((w) => w.first <= range.last)
+    .map((w) => stretchScore(w.first, w.end < range.last ? w.end : range.last));
+  const days = weeks.reduce((sum, w) => sum + w.days, 0);            // days so far
+  const monthDays = daysBetween(range.first, range.end);              // days in all its weeks
+  const average = (key) => (weeks[0][key] === null ? null : weeks.reduce((sum, w) => sum + w[key], 0) / weeks.length);
+  const weeksAvg = average("daily");    // WEEKS: the average week score
+  const optempo = average("weekly");    // DRILLS: the average week's drills
 
   // 2. MONTHLY OPS: the field ops pool and Celebrate Recovery, each an
-  //    equal share (see opsStatus). Mid-month you aren't expected to have
-  //    all 4 yet, so each target grows with the days passed:
-  //    10 days into a 31-day month expects 4 × 10/31 ≈ 1.3.
-  const mission = opsStatus(month + "-01", monthEnd(month), days / monthDays);
-  const ops = mission.pct;
+  //    equal share (see opsStatus). They run on the calendar month, and the
+  //    targets grow with its days passed: 10 days into a 31-day month
+  //    expects 4 × 10/31 ≈ 1.3. Before the 1st (the month's first week can
+  //    start in the month before), nothing is due yet, so ops sit out.
+  const calFirst = month + "-01" < TRACK_START ? TRACK_START : month + "-01";
+  const calLast = monthEnd(month) < asOf ? monthEnd(month) : asOf;
+  const calStarted = calFirst <= calLast;
+  const share = calStarted ? daysBetween(calFirst, calLast) / daysBetween(calFirst, monthEnd(month)) : 1;
+  const mission = opsStatus(month + "-01", monthEnd(month), share);
+  const ops = calStarted ? mission.pct : null;
 
-  // 3. MONTH = weeks × 85% + monthly ops × 15%. Hit everything = 100%.
+  // 3. MONTH = weeks 60% + drills 25% + monthly ops 15%. Hit everything = 100%.
+  const shares = monthShares();
   const statusRaw = blend([
-    { score: weeksAvg, weight: monthShares().weeks },
-    { score: ops, weight: monthShares().ops },
+    { score: weeksAvg, weight: shares.weeks },
+    { score: optempo, weight: shares.drills },
+    { score: ops, weight: shares.ops },
   ]) ?? 0;
 
   // EARNED: how much of the WHOLE month you've banked so far. `status` is
@@ -2868,9 +2888,9 @@ function monthScores(month, asOf) {
   const earnedRaw = statusRaw * (days / monthDays);
 
   return {
-    weeks, days, monthDays,
+    weeks, days, monthDays, first: range.first, last: range.last,
     status: round(statusRaw), statusRaw, earned: round(earnedRaw), earnedRaw,
-    weeksAvg: round(weeksAvg), readiness: round(readiness), optempo: round(optempo),
+    weeksAvg: round(weeksAvg), readiness: round(weeksAvg), optempo: round(optempo),
     mission, missionCount: mission.count, missionDue: mission.due, missionPct: round(ops), monthlyPct: round(ops),
   };
 }
@@ -3015,7 +3035,6 @@ function renderHq() {
       stats.innerHTML =
         `<span>PACE <b class="${statusClass(s.status)}">${s.status}%</b></span>` +
         `<span>WEEKS <b>${pct(s.weeksAvg)}</b></span>` +
-        `<span>READINESS <b>${pct(s.readiness)}</b></span>` +
         `<span>OPTEMPO <b>${pct(s.optempo)}</b></span>` +
         `<span>MISSION <b class="${missionMet ? "good" : ""}">${s.mission.done}/${s.mission.target}</b></span>` +
         (isFiled(`month:${month}`) ? `<span class="filed">AAR FILED</span>` : "");
@@ -3036,7 +3055,7 @@ function renderHq() {
   document.getElementById("hq-months").replaceChildren(...rows);
   const c = chainShares();
   document.getElementById("chain-legend").textContent =
-    `Day = daily habits · Week = days ${c.day}% + drills ${c.drills}% · Month = weeks ${c.weeks}% + monthly ops ${c.ops}% · Year = average of months`;
+    `Day = 50% for the first habit, then equal steps to 100% · Week = average of its days · Month = weeks ${c.weeks}% + drills ${c.drills}% + monthly ops ${c.ops}% · Year = average of months`;
 
   // The year bars under the title: only with the full campaign showing.
   document.getElementById("year-bars").replaceChildren(yearBar("2026"), yearBar("2027"));
@@ -3118,7 +3137,7 @@ function isFiled(key) {
 // ---------------------------------------------------------------------
 // The days of a week that count: never before Oct 11, never after today.
 function weekRange(weekStart) {
-  const end = addDays(weekStart, 6);
+  const end = addDays(weekStart, 6) > campaignEnd() ? campaignEnd() : addDays(weekStart, 6);
   const today = todayKey();
   const first = weekStart < TRACK_START ? TRACK_START : weekStart;
   const last = end < today ? end : today;
@@ -3126,10 +3145,10 @@ function weekRange(weekStart) {
 }
 
 // One drill's score over a stretch, 0–100, done EXACTLY like Optempo:
-// split into Sun–Sat weeks, prorate short weeks, cap each week at 100%,
-// then average the weeks by their days.
+// split into Sun–Sat weeks, prorate a week still going, cap each week at
+// 100%, then average the weeks (every week counts the same).
 function drillPct(habit, from, to) {
-  const days = daysBetween(from, to);
+  let weekCount = 0;
   let weightedSum = 0;
   let weekStart = weekStartKey(from);
   while (weekStart <= to) {
@@ -3138,16 +3157,17 @@ function drillPct(habit, from, to) {
     const b = weekEnd > to ? to : weekEnd;
     const weekDays = daysBetween(a, b);
     const target = habit.target * (weekDays / 7);
-    weightedSum += Math.min(1, countBetween([habit.id], a, b) / target) * weekDays;
+    weightedSum += Math.min(1, countBetween([habit.id], a, b) / target);
+    weekCount += 1;
     weekStart = addDays(weekStart, 7);
   }
-  return (weightedSum / days) * 100;
+  return (weightedSum / weekCount) * 100;
 }
 
 function weekScores(weekStart) {
   const range = weekRange(weekStart);
   if (!range) return null;
-  // WEEK = daily part × 60/85 + weekly part × 25/85, up to today.
+  // WEEK = the average of its days, up to today. Drills shown alongside.
   const w = stretchScore(range.first, range.last);
   // Monthly ops logged this week: shown for reference, scored in the month.
   const outdoorIds = activeHabits().filter((h) => h.category === "outdoor").map((h) => h.id);
@@ -3206,14 +3226,14 @@ function brkTotal(label, percent, note) {
 function breakdown(s, from, to, mode) {
   const days = daysBetween(from, to);
   const parts = [];
-  const weekTotal = weekShares().daily + weekShares().weekly;
-  const monthTotal = monthShares().weeks + monthShares().ops;
+  const shares = monthShares();
+  const monthTotal = shares.weeks + shares.drills + shares.ops;
 
   // Each daily habit's share of the days, weakest first.
   const dailyRows = () => activeHabits().filter((h) => h.category === "daily")
     .map((h) => ({ h, count: countBetween([h.id], from, to) }))
     .sort((a, b) => a.count - b.count)
-    .map(({ h, count }) => brkRow(h.name, Math.round((count / days) * 100), `${count}/${days} d`));
+    .map(({ h, count }) => brkRow(h.name, Math.round((count / days) * 100), `${count}/${days} d`));   // days it was done
   // Each weekly goal, scored exactly like the weekly part.
   const drillRows = () => activeHabits().filter((h) => h.category === "weekly").map((h) => {
     const count = countBetween([h.id], from, to);
@@ -3230,27 +3250,32 @@ function breakdown(s, from, to, mode) {
   };
 
   if (mode === "debrief") {
-    // WEEK = daily part + weekly part.
-    parts.push(brkGroup("DAILY ORDERS", weekShares().daily / weekTotal, s.readiness, "WEEK"), ...dailyRows());
-    parts.push(brkGroup("WEEKLY DRILLS", weekShares().weekly / weekTotal, s.optempo, "WEEK"), ...drillRows());
-    parts.push(brkTotal("WEEK SCORE", s.status, `pace · ${s.earned}% earned`));
+    // WEEK = the average of its days. Drills and ops count in the month.
+    parts.push(brkGroup("DAILY ORDERS", 1, s.readiness, "WEEK"));
+    for (let day = from; day <= to; day = addDays(day, 1)) {
+      const done = activeHabits().filter((h) => h.category === "daily" && isDone(h.id, day)).length;
+      parts.push(brkRow(shortDate(day), dayScore(day) ?? 0, `${done} done`));
+    }
+    parts.push(brkTotal("WEEK SCORE", s.status, `average of its days · ${s.earned}% earned`));
+    parts.push(brkHeading("HABITS THIS WEEK", "days done"), ...dailyRows());
+    parts.push(brkHeading("WEEKLY DRILLS", `${pct(s.optempo)} · scored in the month`), ...drillRows());
     parts.push(brkHeading("MONTHLY OPS THIS WEEK", "scored in the month"), opsLine());
   } else {
-    // MONTH = its weeks + monthly ops.
-    parts.push(brkGroup("WEEKS", monthShares().weeks / monthTotal, s.weeksAvg, "MONTH"));
+    // MONTH = its weeks + weekly drills + monthly ops.
+    parts.push(brkGroup("WEEKS", shares.weeks / monthTotal, s.weeksAvg, "MONTH"));
     for (const w of s.weeks) {
-      const label = `${shortDate(w.from)}–${Number(w.to.slice(8))}`;
+      const label = `${shortDate(w.from)}–${shortDate(w.to)}`;
       parts.push(brkRow(label, round(w.score ?? 0), `${w.days} d`));
     }
-    parts.push(brkGroup("MONTHLY OPS", monthShares().ops / monthTotal, s.missionPct, "MONTH"));
+    parts.push(brkGroup("WEEKLY DRILLS", shares.drills / monthTotal, s.optempo, "MONTH"), ...drillRows());
+    parts.push(brkGroup("MONTHLY OPS", shares.ops / monthTotal, s.missionPct, "MONTH"));
     for (const line of s.mission.lines) {
       parts.push(brkRow(line.name, round(line.pct), `${line.count}/${line.target} · ${line.due.toFixed(1)} due`));
     }
     parts.push(opsLine());
     parts.push(brkTotal("MONTH SCORE", s.status, `pace · ${s.earned}% earned`));
     // Inside the weeks: every habit, to see what moved the score.
-    parts.push(brkHeading("INSIDE THE WEEKS · DAILY ORDERS", pct(s.readiness)), ...dailyRows());
-    parts.push(brkHeading("INSIDE THE WEEKS · WEEKLY DRILLS", pct(s.optempo)), ...drillRows());
+    parts.push(brkHeading("INSIDE THE WEEKS · DAILY ORDERS", "days done"), ...dailyRows());
   }
   return parts;
 }
@@ -3394,7 +3419,7 @@ function renderReview() {
     next.disabled = reviewWeek >= weekStartKey(today);
     document.getElementById("review-q-title").textContent = "// DEBRIEF";
     document.getElementById("review-legend").textContent =
-      `Week score = daily orders ${chainShares().day}% + weekly drills ${chainShares().drills}%. Each daily habit is an equal share of a day; each drill an equal share of the drills, capped at 100%. Monthly ops count in the month.`;
+      `Week score = the average of its days. A day is 0% with nothing done, 50% with your first habit, and climbs in equal steps to 100% with all of them. Weekly drills and monthly ops count in the month.`;
   } else {
     s = monthScores(reviewMonth);
     const range = scoredRange(reviewMonth);
@@ -3407,7 +3432,7 @@ function renderReview() {
     next.disabled = reviewMonth >= monthOf(today);
     document.getElementById("review-q-title").textContent = "// AFTER ACTION REVIEW";
     document.getElementById("review-legend").textContent =
-      `Month score = its weeks ${chainShares().weeks}% (averaged by their days) + monthly ops ${chainShares().ops}% (${opsLines().map((line) => `${line.name} ${line.target}`).join(" + ")} a month, each an equal share; the targets grow with the days passed). The year is the average of its months.`;
+      `Month score = its weeks ${chainShares().weeks}% (every Sun–Sat week counts the same; a week belongs to the month with most of its days) + weekly drills ${chainShares().drills}% + monthly ops ${chainShares().ops}% (${opsLines().map((line) => `${line.name} ${line.target}`).join(" + ")} a month, each an equal share; the targets grow with the days passed). The year is the average of its months.`;
   }
 
   document.getElementById("review-questions").replaceChildren(
@@ -3419,10 +3444,10 @@ function renderReview() {
     `<span class="${statusClass(s.status)}">${s.status}%</span>`, `${s.earned}% of ${unit} earned`, false);
   document.getElementById("review-tiles").innerHTML = unit === "week"
     ? scoreTile +
-      tile("READINESS", pct(s.readiness), `daily · ${chainShares().day}%`, s.readiness >= 100) +
-      tile("OPTEMPO", pct(s.optempo), `drills · ${chainShares().drills}%`, s.optempo >= 100)
+      tile("OPTEMPO", pct(s.optempo), "drills · in the month", s.optempo >= 100)
     : scoreTile +
       tile("WEEKS", pct(s.weeksAvg), `weeks · ${chainShares().weeks}%`, s.weeksAvg >= 100) +
+      tile("OPTEMPO", pct(s.optempo), `drills · ${chainShares().drills}%`, s.optempo >= 100) +
       tile("MISSION", pct(s.missionPct), `monthly ops · ${chainShares().ops}%`, s.missionPct >= 100);
   document.getElementById("review-range").textContent = `${shortDate(from)} – ${shortDate(to)}`;
   document.getElementById("review-breakdown").replaceChildren(...breakdown(s, from, to, reviewMode));
@@ -3832,7 +3857,7 @@ function computeStats() {
 
     if (finished) {
       const w = stretchScore(range.first, range.last);
-      if (w.score !== null && w.score >= 99.95) perfectWeeks += 1;
+      if (w.daily !== null && w.daily >= 99.95 && (w.weekly === null || w.weekly >= 99.95)) perfectWeeks += 1;
       drillRun = w.weekly !== null && w.weekly >= 99.95 ? drillRun + 1 : 0;
       bestDrillRun = Math.max(bestDrillRun, drillRun);
     }
@@ -4558,7 +4583,7 @@ function renderGoalEditor() {
     el("div", "note pad", "Monthly habits with /MO set to 0 share this target. One with its own /MO (like Celebrate Recovery, 4) is its own line. Each line is an equal share of monthly ops."),
     ...weightRows,
     message,
-    el("div", "note pad", `So a week = days ${c.day}% + drills ${c.drills}%, and a month = weeks ${c.weeks}% + monthly ops ${c.ops}%.`)
+    el("div", "note pad", `So a month = weeks ${c.weeks}% + drills ${c.drills}% + monthly ops ${c.ops}%. A week is the average of its days.`)
   );
   const w = settings.weights;
   document.getElementById("sum-goals").textContent =
