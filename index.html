@@ -2117,9 +2117,10 @@ const DEFAULT_HABITS = [
   { id: "fishing",   name: "Fishing",             category: "outdoor" },
   { id: "hunting",   name: "Hunting",             category: "outdoor" },
   { id: "hiking",    name: "Hiking",              category: "outdoor" },
-  // Celebrate Recovery is a monthly op: it counts with the field outings,
-  // toward one combined monthly target.
-  { id: "cr",        name: "Celebrate Recovery",  short: "Celeb. Rec.", category: "outdoor" },
+  // Celebrate Recovery is a monthly op with its OWN target (ownTarget):
+  // 4 meetings a month, scored as its own line. The field outings above
+  // share the pooled target, settings.outdoorTarget.
+  { id: "cr",        name: "Celebrate Recovery",  short: "Celeb. Rec.", category: "outdoor", ownTarget: 4 },
 ];
 
 const TRACK_START = "2026-10-11";   // first day of the campaign
@@ -2176,7 +2177,7 @@ const SETTINGS_KEY = "opslog-stage1-settings";
 const DEFAULT_SETTINGS = {
   name: "",                  // shown with your rank
   habits: DEFAULT_HABITS,    // the starting list, used the very first time
-  outdoorTarget: 8,          // monthly ops per month, all monthly habits combined
+  outdoorTarget: 4,          // field ops per month, shared by monthly habits without their own target
   weights: { daily: 0.60, weekly: 0.25, outdoor: 0.15 },   // see THE SCORE CHAIN
   theme: "auto",             // "auto" = follow the month, or a month like "2027-03"
   motion: "system",          // "system", "reduce" or "full"
@@ -2198,10 +2199,22 @@ function mergeSettings(saved) {
 
 function loadSettings() {
   try {
-    return mergeSettings(JSON.parse(localStorage.getItem(SETTINGS_KEY)));
+    return splitCR(mergeSettings(JSON.parse(localStorage.getItem(SETTINGS_KEY))));
   } catch (error) {
     return mergeSettings();
   }
+}
+
+// One-time update (Oct 18, 2026): Celebrate Recovery used to share one
+// pool of 8 with the field outings. Now it's its own line, 4 a month, and
+// the outings pool is 4. Saved settings from before get the same change
+// once; `crSplit` remembers it's done, so a target you change later stays.
+function splitCR(s) {
+  if (s.crSplit) return s;
+  s.habits = s.habits.map((h) => (h.id === "cr" && !h.ownTarget ? { ...h, ownTarget: 4 } : h));
+  if (s.outdoorTarget === 8) s.outdoorTarget = 4;
+  s.crSplit = true;
+  return s;
 }
 
 function saveSettings() {
@@ -2396,12 +2409,11 @@ function scoresFor(day) {
   const drills = weekly;
   const drillsMet = drills.filter((h) => countBetween([h.id], weekStart, weekEnd) >= h.target).length;
 
-  // MISSION: monthly ops this month, all four combined.
+  // MISSION: monthly ops this month, every line (field ops pool, CR, ...).
   const month = monthOf(day);
-  const outdoorIds = outdoor.map((h) => h.id);
-  const missionCount = logs.filter((log) => outdoorIds.includes(log.habit) && monthOf(log.date) === month).length;
+  const mission = opsStatus(month + "-01", monthEnd(month), 1);
 
-  return { daily, weekly, outdoor, drills, dailyDone, readiness, optempo, drillsMet, weekStart, weekEnd, month, missionCount };
+  return { daily, weekly, outdoor, drills, dailyDone, readiness, optempo, drillsMet, weekStart, weekEnd, month, mission };
 }
 
 // WEEKLY PART for one stretch of days, 0–100. Each weekly goal gets an
@@ -2423,33 +2435,63 @@ function drillScore(from, to, share) {
   return round(drillRaw(from, to, share));
 }
 
-// DAILY PART for a stretch: the average of its days' scores. (Same as
-// check-offs ÷ (daily habits × days), which is quicker to count.)
+// DAILY PART for a stretch: the average of its days' scores (dayRaw).
 function dailyAvg(from, to) {
   const ids = activeHabits().filter((h) => h.category === "daily").map((h) => h.id);
   if (ids.length === 0) return null;
-  return (countBetween(ids, from, to) / (ids.length * daysBetween(from, to))) * 100;
+  let sum = 0;
+  for (let day = from; day <= to; day = addDays(day, 1)) {
+    sum += dayFromCount(ids.filter((id) => isDone(id, day)).length, ids.length);
+  }
+  return sum / daysBetween(from, to);
 }
 
-// WEEK: one Sun–Sat week, or the piece of it inside a month or up to
-// today. Short pieces get prorated weekly targets (3 days = 3/7 of each).
-// WEEK = daily part × 60/85 + weekly part × 25/85.
+// WEEK: one Sun–Sat week (up to today while it's still going).
+// WEEK SCORE = the average of its days. 85% every day = an 85% week.
+// The week's drills are worked out here too (`weekly`), but they count
+// in the MONTH, not in the week. A week still going expects drills for
+// the days so far (3 days = 3/7 of each target).
 function stretchScore(from, to) {
   const days = daysBetween(from, to);
   const daily = dailyAvg(from, to);
   const weekly = drillRaw(from, to, days / 7);
-  const score = blend([
-    { score: daily, weight: weekShares().daily },
-    { score: weekly, weight: weekShares().weekly },
-  ]);
-  return { from, to, days, daily, weekly, score };
+  return { from, to, days, daily, weekly, score: daily };
 }
 
-// MONTHLY OPS: every monthly habit counted together against settings.outdoorTarget.
-// `due` is the share of the target the days so far call for. Capped at 100%.
-function opsRaw(count, due) {
-  if (!activeHabits().some((h) => h.category === "outdoor")) return null;
-  return Math.min(100, (count / due) * 100);
+// MONTHLY OPS LINES. A monthly habit with its own target (ownTarget, like
+// Celebrate Recovery's 4) is a line of its own. Every other monthly habit
+// (fishing, hunting, hiking) goes in one shared pool, the "Field ops" line,
+// with the target settings.outdoorTarget.
+function opsLines() {
+  const outdoor = activeHabits().filter((h) => h.category === "outdoor");
+  const pooled = outdoor.filter((h) => !h.ownTarget);
+  const lines = outdoor.filter((h) => h.ownTarget)
+    .map((h) => ({ name: h.short || h.name, ids: [h.id], target: h.ownTarget }));
+  if (pooled.length > 0) lines.unshift({ name: "Field ops", ids: pooled.map((h) => h.id), target: settings.outdoorTarget });
+  return lines;
+}
+
+// MONTHLY OPS score for a stretch of a month, 0–100 (null with no monthly
+// habits). Like the weekly drills, each line is an EQUAL share, capped at
+// 100%, so extra fishing can't cover a missed CR meeting.
+// `share` is how much of the target the days so far call for: 10 days into
+// a 31-day month expects CR 4 × 10/31 ≈ 1.3 meetings.
+function opsStatus(from, to, share) {
+  const lines = opsLines().map((line) => {
+    const count = countBetween(line.ids, from, to);
+    const due = line.target * share;
+    return { ...line, count, due, pct: Math.min(100, (count / due) * 100), met: count >= line.target };
+  });
+  const sum = (key) => lines.reduce((total, line) => total + line[key], 0);
+  return {
+    lines,
+    count: sum("count"),                                                 // every check-off
+    done: lines.reduce((t, l) => t + Math.min(l.count, l.target), 0),   // check-offs that count (capped)
+    target: sum("target"),                                               // 4 + 4 = 8
+    due: sum("due"),
+    pct: lines.length ? sum("pct") / lines.length : null,
+    met: lines.length > 0 && lines.every((line) => line.met),            // every line hit its target
+  };
 }
 
 // =====================================================================
@@ -2573,11 +2615,11 @@ function renderToday() {
   renderWeek(s.weekStart);
 
   // Score tiles
-  const missionMet = s.missionCount >= settings.outdoorTarget;
+  const missionMet = s.mission.met;
   document.getElementById("tiles").innerHTML =
     tile("READINESS", pct(s.readiness), `${s.dailyDone}/${s.daily.length} today`, false) +
     tile("OPTEMPO", pct(s.optempo), `${s.drillsMet}/${s.drills.length} drills met`, false) +
-    tile("MISSION", `${s.missionCount}/${settings.outdoorTarget}`, missionMet ? "OBJECTIVE MET" : "monthly ops", missionMet);
+    tile("MISSION", `${s.mission.done}/${s.mission.target}`, missionMet ? "OBJECTIVE MET" : "monthly ops", missionMet);
 
   // Daily orders
   const dailyList = document.getElementById("daily-list");
@@ -2592,13 +2634,16 @@ function renderToday() {
   }));
   document.getElementById("week-range").textContent = `${prettyDay(s.weekStart).slice(4)} – ${prettyDay(s.weekEnd).slice(4)}`;
 
-  // Monthly ops: each outdoor habit's count this month
+  // Monthly ops: each outdoor habit's count this month. A habit with its
+  // own target shows count/target; pooled ones just show their count.
   const outdoorList = document.getElementById("outdoor-list");
   outdoorList.replaceChildren(...openFirst(s.outdoor).map((h) => {
     const count = logs.filter((log) => log.habit === h.id && monthOf(log.date) === s.month).length;
-    return habitRow(h, `${count} this mo`);
+    return habitRow(h, h.ownTarget ? `${count}/${h.ownTarget} mo` : `${count} this mo`);
   }));
-  document.getElementById("month-count").textContent = `${s.missionCount}/${settings.outdoorTarget} combined`;
+  // Header: each line's progress, like "Field ops 2/4 · Celeb. Rec. 1/4".
+  document.getElementById("month-count").textContent =
+    s.mission.lines.map((line) => `${line.name} ${line.count}/${line.target}`).join(" · ");
 }
 
 // =====================================================================
@@ -2622,13 +2667,21 @@ function el(tag, className, text) {
   return node;
 }
 
-// DAY: the share of your daily orders done that day, 0–100. Each daily
-// habit is 1/x of the day. null if you have no daily habits at all.
+// DAY: 0–100. Nothing done = 0%. The FIRST habit done = 50%, and every
+// habit after it adds the same step, up to 100% with all of them done.
+// With 11 daily habits each step is 50 ÷ 10 = 5%: 1 = 50%, 2 = 55%,
+// 8 = 85%, 11 = 100%. (Jordan's rule, 2026-10-26.) null if you have no
+// daily habits at all.
+function dayFromCount(done, total) {
+  if (total === 0) return null;
+  if (done === 0) return 0;
+  if (total === 1) return 100;                     // one habit: done = all done
+  return 50 + (50 * (done - 1)) / (total - 1);
+}
 function dayRaw(day) {
   const daily = activeHabits().filter((h) => h.category === "daily");
-  if (daily.length === 0) return null;
   const done = daily.filter((h) => isDone(h.id, day)).length;
-  return (done / daily.length) * 100;
+  return dayFromCount(done, daily.length);
 }
 function dayScore(day) {
   return round(dayRaw(day));
@@ -2710,42 +2763,34 @@ function monthEnd(month) {
 // =====================================================================
 // THE SCORE CHAIN:  DAY → WEEK → MONTH → YEAR
 //
-//   DAY   = daily habits done ÷ how many daily habits you have.
-//           Every daily habit is 1/x of the day, whatever x is.
-//   WEEK  = the week's days (its daily part) + its weekly goals.
-//           Every weekly goal is 1/x of the weekly part, capped at 100%.
-//   MONTH = the month's weeks (averaged by their days) + the monthly ops
-//           (field goals: fishing, hunting, hiking, Celebrate Recovery).
+//   DAY   = nothing done 0%, first habit 50%, then equal steps to 100%.
+//   WEEK  = the average of its 7 days (Sun–Sat). Weeks are never cut at
+//           a month's edge: a week belongs to the month holding most of
+//           its days (the month its Wednesday is in).
+//   MONTH = its weeks (every week counts the same) + its weekly drills
+//           (each week's drills, averaged; every drill an equal share,
+//           capped at 100%) + the monthly ops (field ops pool and
+//           Celebrate Recovery, each line an equal share).
 //   YEAR  = the average of its months.
 //
-// The shares come from settings.weights (60 / 25 / 15 to start):
-//   inside a week:  daily 60 : weekly 25  →  70.6% / 29.4% of the week
-//   inside a month: weeks 85 : ops 15     →  85% / 15% of the month
-// so a month still works out to daily 60 · weekly 25 · ops 15 overall.
-// Add or remove habits and every level still tops out at exactly 100%.
-// A level with NO habits in it (say, zero weekly goals) passes its share
+// The month's shares come from settings.weights (60 / 25 / 15 to start):
+//   weeks 60 · drills 25 · monthly ops 15. Hit everything = 100%.
+// A part with NO habits in it (say, zero weekly goals) passes its share
 // to the others instead of counting as a zero.
 // =====================================================================
 // The weights live in settings.weights, so Settings → Goals & Scoring can
-// change them. These read them fresh every time.
-function weekShares() {
-  const w = settings.weights;
-  return { daily: w.daily, weekly: w.weekly };                    // 60 : 25
-}
+// change them. This reads them fresh every time.
 function monthShares() {
   const w = settings.weights;
-  return { weeks: w.daily + w.weekly, ops: w.outdoor };           // 85 : 15
+  return { weeks: w.daily, drills: w.weekly, ops: w.outdoor };    // 60 : 25 : 15
 }
 
-// The chain's shares as percents for labels: { day: 70.6, drills: 29.4, weeks: 85, ops: 15 }
+// The month's shares as percents for labels: { weeks: 60, drills: 25, ops: 15 }
 function chainShares() {
-  const wk = weekShares();
-  const mo = monthShares();
-  const one = (part, whole) => (whole ? Math.round((part / whole) * 1000) / 10 : 0);
-  return {
-    day: one(wk.daily, wk.daily + wk.weekly), drills: one(wk.weekly, wk.daily + wk.weekly),
-    weeks: one(mo.weeks, mo.weeks + mo.ops), ops: one(mo.ops, mo.weeks + mo.ops),
-  };
+  const m = monthShares();
+  const total = m.weeks + m.drills + m.ops;
+  const one = (part) => (total ? Math.round((part / total) * 1000) / 10 : 0);
+  return { weeks: one(m.weeks), drills: one(m.drills), ops: one(m.ops) };
 }
 
 // Mix scores by weight. A part whose score is null (no habits of that
@@ -2767,15 +2812,50 @@ function round(n) {
 // month keys straight out of the OPERATIONS list.
 const MONTHS = Object.keys(OPERATIONS);
 
-// The days of a month that count so far: never before Oct 11, never after today.
-// Returns null for a month that hasn't started yet.
+// The last day of the campaign (Dec 31, 2027).
+const CAMPAIGN_END = monthEnd(MONTHS[MONTHS.length - 1]);
+
+// The month a day's SCORE goes to: the month its week belongs to (the one
+// holding that week's Wednesday). Nov 30, 2026 -> "2026-12"; Jan 1, 2027
+// -> "2026-12" (its week, Dec 27 – Jan 2, is December's last).
+function scoreMonthOf(day) {
+  return monthOf(addDays(weekStartKey(day), 3));
+}
+
+// A month is CLOSED once its last week has ended (up to 3 days past the
+// calendar month), so its score can't change any more.
+function monthClosed(month, today = todayKey()) {
+  const weeks = monthWeeks(month);
+  return (weeks.length ? weeks[weeks.length - 1].end : monthEnd(month)) < today;
+}
+
+// A month's WEEKS: every Sun–Sat week whose Wednesday is in the month, so
+// each week belongs to exactly one month (the one with most of its days).
+// Nov 29 – Dec 5, 2026 belongs to December. Weeks before Oct 11 are skipped.
+// Each comes back as { start, first, end }: first/end are the week's days
+// inside the campaign (Oct 11 to Dec 31, 2027).
+function monthWeeks(month) {
+  const weeks = [];
+  for (let ws = weekStartKey(month + "-01"); ws <= monthEnd(month); ws = addDays(ws, 7)) {
+    if (monthOf(addDays(ws, 3)) !== month) continue;         // its Wednesday is in another month
+    const first = ws < TRACK_START ? TRACK_START : ws;
+    const we = addDays(ws, 6);
+    const end = we > CAMPAIGN_END ? CAMPAIGN_END : we;
+    if (first <= end) weeks.push({ start: ws, first, end });
+  }
+  return weeks;
+}
+
+// The days of a month's weeks that count so far (never after today).
+// Returns null for a month whose first week hasn't started yet.
 // `asOf` (optional) reads the month as it stood on an earlier day.
 function scoredRange(month, asOf = todayKey()) {
-  const first = month + "-01" < TRACK_START ? TRACK_START : month + "-01";
-  const end = monthEnd(month);
-  const today = asOf;
-  const last = end < today ? end : today;
-  return first <= last ? { first, last } : null;
+  const weeks = monthWeeks(month);
+  if (weeks.length === 0) return null;
+  const first = weeks[0].first;
+  const end = weeks[weeks.length - 1].end;
+  const last = end < asOf ? end : asOf;
+  return first <= last ? { first, last, end } : null;
 }
 
 // How many days from a to b, counting both ends. 86400000 = ms in a day.
@@ -2783,39 +2863,39 @@ function daysBetween(a, b) {
   return Math.round((parseKey(b) - parseKey(a)) / 86400000) + 1;
 }
 
-function monthScores(month, asOf) {
+function monthScores(month, asOf = todayKey()) {
   const range = scoredRange(month, asOf);
   if (!range) return null;   // upcoming month: nothing to score yet
-  const days = daysBetween(range.first, range.last);
-  const monthDays = daysBetween(range.first, monthEnd(month));
 
-  // 1. THE WEEKS. Each Sun–Sat week is cut to the month's edges (and to
-  //    today) and scored with stretchScore. They're averaged by their
-  //    days, so a full 7-day week counts 7× as much as a 1-day sliver.
-  const weeks = [];
-  for (let ws = weekStartKey(range.first); ws <= range.last; ws = addDays(ws, 7)) {
-    const from = ws < range.first ? range.first : ws;
-    const we = addDays(ws, 6);
-    weeks.push(stretchScore(from, we > range.last ? range.last : we));
-  }
-  const byDays = (key) =>
-    weeks[0][key] === null ? null : weeks.reduce((sum, w) => sum + w[key] * w.days, 0) / days;
-  const weeksAvg = byDays("score");
-  const readiness = byDays("daily");    // the daily part, for reference
-  const optempo = byDays("weekly");     // the weekly part, for reference
+  // 1. THE WEEKS that have started, each scored up to today. Every week
+  //    counts the same, whole or still going.
+  const weeks = monthWeeks(month)
+    .filter((w) => w.first <= range.last)
+    .map((w) => stretchScore(w.first, w.end < range.last ? w.end : range.last));
+  const days = weeks.reduce((sum, w) => sum + w.days, 0);            // days so far
+  const monthDays = daysBetween(range.first, range.end);              // days in all its weeks
+  const average = (key) => (weeks[0][key] === null ? null : weeks.reduce((sum, w) => sum + w[key], 0) / weeks.length);
+  const weeksAvg = average("daily");    // WEEKS: the average week score
+  const optempo = average("weekly");    // DRILLS: the average week's drills
 
-  // 2. MONTHLY OPS (field goals): all of them counted together. Mid-month
-  //    you aren't expected to have all 8 yet, so the target grows with the
-  //    days passed: 10 days into a 31-day month expects 8 × 10/31 ≈ 2.6.
-  const outdoorIds = activeHabits().filter((h) => h.category === "outdoor").map((h) => h.id);
-  const missionCount = countBetween(outdoorIds, month + "-01", monthEnd(month));
-  const missionDue = settings.outdoorTarget * (days / monthDays);
-  const ops = opsRaw(missionCount, missionDue);
+  // 2. MONTHLY OPS: the field ops pool and Celebrate Recovery, each an
+  //    equal share (see opsStatus). They run on the calendar month, and the
+  //    targets grow with its days passed: 10 days into a 31-day month
+  //    expects 4 × 10/31 ≈ 1.3. Before the 1st (the month's first week can
+  //    start in the month before), nothing is due yet, so ops sit out.
+  const calFirst = month + "-01" < TRACK_START ? TRACK_START : month + "-01";
+  const calLast = monthEnd(month) < asOf ? monthEnd(month) : asOf;
+  const calStarted = calFirst <= calLast;
+  const share = calStarted ? daysBetween(calFirst, calLast) / daysBetween(calFirst, monthEnd(month)) : 1;
+  const mission = opsStatus(month + "-01", monthEnd(month), share);
+  const ops = calStarted ? mission.pct : null;
 
-  // 3. MONTH = weeks × 85% + monthly ops × 15%. Hit everything = 100%.
+  // 3. MONTH = weeks 60% + drills 25% + monthly ops 15%. Hit everything = 100%.
+  const shares = monthShares();
   const statusRaw = blend([
-    { score: weeksAvg, weight: monthShares().weeks },
-    { score: ops, weight: monthShares().ops },
+    { score: weeksAvg, weight: shares.weeks },
+    { score: optempo, weight: shares.drills },
+    { score: ops, weight: shares.ops },
   ]) ?? 0;
 
   // EARNED: how much of the WHOLE month you've banked so far. `status` is
@@ -2824,10 +2904,10 @@ function monthScores(month, asOf) {
   const earnedRaw = statusRaw * (days / monthDays);
 
   return {
-    weeks, days, monthDays,
+    weeks, days, monthDays, first: range.first, last: range.last, calFirst, calLast,
     status: round(statusRaw), statusRaw, earned: round(earnedRaw), earnedRaw,
-    weeksAvg: round(weeksAvg), readiness: round(readiness), optempo: round(optempo),
-    missionCount, missionDue, missionPct: round(ops), monthlyPct: round(ops),
+    weeksAvg: round(weeksAvg), optempo: round(optempo),
+    mission, missionCount: mission.count, missionDue: mission.due, missionPct: round(ops), monthlyPct: round(ops),
   };
 }
 
@@ -2937,7 +3017,7 @@ function yearBar(year) {
 let hqShowAll = false;
 
 function renderHq() {
-  const current = monthOf(todayKey());
+  const current = scoreMonthOf(todayKey());   // the month today's week counts in
   const rows = [];
   // Before Oct 11 or after Dec 2027 there's no current month: show them all.
   const focus = !hqShowAll && MONTHS.includes(current);
@@ -2967,13 +3047,12 @@ function renderHq() {
 
     const stats = el("div", "stats");
     if (s) {
-      const missionMet = s.missionCount >= settings.outdoorTarget;
+      const missionMet = s.mission.met;
       stats.innerHTML =
         `<span>PACE <b class="${statusClass(s.status)}">${s.status}%</b></span>` +
         `<span>WEEKS <b>${pct(s.weeksAvg)}</b></span>` +
-        `<span>READINESS <b>${pct(s.readiness)}</b></span>` +
         `<span>OPTEMPO <b>${pct(s.optempo)}</b></span>` +
-        `<span>MISSION <b class="${missionMet ? "good" : ""}">${s.missionCount}/${settings.outdoorTarget}</b></span>` +
+        `<span>MISSION <b class="${missionMet ? "good" : ""}">${s.mission.done}/${s.mission.target}</b></span>` +
         (isFiled(`month:${month}`) ? `<span class="filed">AAR FILED</span>` : "");
     } else {
       stats.textContent = "Not started";
@@ -2992,7 +3071,7 @@ function renderHq() {
   document.getElementById("hq-months").replaceChildren(...rows);
   const c = chainShares();
   document.getElementById("chain-legend").textContent =
-    `Day = daily habits · Week = days ${c.day}% + drills ${c.drills}% · Month = weeks ${c.weeks}% + monthly ops ${c.ops}% · Year = average of months`;
+    `Day = 50% for the first habit, then equal steps to 100% · Week = average of its days · Month = weeks ${c.weeks}% + drills ${c.drills}% + monthly ops ${c.ops}% · Year = average of months`;
 
   // The year bars under the title: only with the full campaign showing.
   document.getElementById("year-bars").replaceChildren(yearBar("2026"), yearBar("2027"));
@@ -3057,7 +3136,7 @@ function saveReviews() {
 let reviews = loadReviews();
 let reviewMode = "debrief";                    // "debrief" or "aar"
 let reviewWeek = weekStartKey(todayKey());     // the Sunday of the week on screen
-let reviewMonth = monthOf(todayKey());         // the month on screen
+let reviewMonth = scoreMonthOf(todayKey());    // the month on screen (today's week's month)
 
 function reviewKey() {
   return reviewMode === "debrief" ? `week:${reviewWeek}` : `month:${reviewMonth}`;
@@ -3074,7 +3153,8 @@ function isFiled(key) {
 // ---------------------------------------------------------------------
 // The days of a week that count: never before Oct 11, never after today.
 function weekRange(weekStart) {
-  const end = addDays(weekStart, 6);
+  const we = addDays(weekStart, 6);
+  const end = we > CAMPAIGN_END ? CAMPAIGN_END : we;
   const today = todayKey();
   const first = weekStart < TRACK_START ? TRACK_START : weekStart;
   const last = end < today ? end : today;
@@ -3082,10 +3162,10 @@ function weekRange(weekStart) {
 }
 
 // One drill's score over a stretch, 0–100, done EXACTLY like Optempo:
-// split into Sun–Sat weeks, prorate short weeks, cap each week at 100%,
-// then average the weeks by their days.
+// split into Sun–Sat weeks, prorate a week still going, cap each week at
+// 100%, then average the weeks (every week counts the same).
 function drillPct(habit, from, to) {
-  const days = daysBetween(from, to);
+  let weekCount = 0;
   let weightedSum = 0;
   let weekStart = weekStartKey(from);
   while (weekStart <= to) {
@@ -3094,22 +3174,24 @@ function drillPct(habit, from, to) {
     const b = weekEnd > to ? to : weekEnd;
     const weekDays = daysBetween(a, b);
     const target = habit.target * (weekDays / 7);
-    weightedSum += Math.min(1, countBetween([habit.id], a, b) / target) * weekDays;
+    weightedSum += Math.min(1, countBetween([habit.id], a, b) / target);
+    weekCount += 1;
     weekStart = addDays(weekStart, 7);
   }
-  return (weightedSum / days) * 100;
+  return (weightedSum / weekCount) * 100;
 }
 
 function weekScores(weekStart) {
   const range = weekRange(weekStart);
   if (!range) return null;
-  // WEEK = daily part × 60/85 + weekly part × 25/85, up to today.
+  // WEEK = the average of its days, up to today. Drills shown alongside.
   const w = stretchScore(range.first, range.last);
   // Monthly ops logged this week: shown for reference, scored in the month.
   const outdoorIds = activeHabits().filter((h) => h.category === "outdoor").map((h) => h.id);
   const missionCount = countBetween(outdoorIds, range.first, range.last);
-  // EARNED: share of the WHOLE week banked so far (score × days/7).
-  const earnedRaw = (w.score ?? 0) * (w.days / 7);
+  // EARNED: share of the WHOLE week banked so far (score × days so far ÷
+  // days in the week; 7, except the campaign's last week, which is 6).
+  const earnedRaw = (w.score ?? 0) * (w.days / daysBetween(range.first, range.end));
   return {
     ...range, days: w.days,
     status: round(w.score ?? 0), statusRaw: w.score ?? 0, earned: round(earnedRaw),
@@ -3162,14 +3244,14 @@ function brkTotal(label, percent, note) {
 function breakdown(s, from, to, mode) {
   const days = daysBetween(from, to);
   const parts = [];
-  const weekTotal = weekShares().daily + weekShares().weekly;
-  const monthTotal = monthShares().weeks + monthShares().ops;
+  const shares = monthShares();
+  const monthTotal = shares.weeks + shares.drills + shares.ops;
 
   // Each daily habit's share of the days, weakest first.
   const dailyRows = () => activeHabits().filter((h) => h.category === "daily")
     .map((h) => ({ h, count: countBetween([h.id], from, to) }))
     .sort((a, b) => a.count - b.count)
-    .map(({ h, count }) => brkRow(h.name, Math.round((count / days) * 100), `${count}/${days} d`));
+    .map(({ h, count }) => brkRow(h.name, Math.round((count / days) * 100), `${count}/${days} d`));   // days it was done
   // Each weekly goal, scored exactly like the weekly part.
   const drillRows = () => activeHabits().filter((h) => h.category === "weekly").map((h) => {
     const count = countBetween([h.id], from, to);
@@ -3177,34 +3259,45 @@ function breakdown(s, from, to, mode) {
     return brkRow(h.short || h.name, Math.round(drillPct(h, from, to)), detail);
   });
   // What went into the monthly ops pool.
+  // In an AAR, monthly ops count over the calendar month so far, the same
+  // days as MISSION (before the 1st, nothing yet).
+  const opsCount = (id) => mode === "debrief" ? countBetween([id], from, to)
+    : s.calFirst <= s.calLast ? countBetween([id], s.calFirst, s.calLast) : 0;
   const opsLine = () => {
     const ops = activeHabits().filter((h) => h.category === "outdoor")
-      .map((h) => `${h.short || h.name} ${countBetween([h.id], from, to)}`);
+      .map((h) => `${h.short || h.name} ${opsCount(h.id)}`);
     const line = el("div", "note", ops.join(" · "));
     line.style.padding = "6px 12px";
     return line;
   };
 
   if (mode === "debrief") {
-    // WEEK = daily part + weekly part.
-    parts.push(brkGroup("DAILY ORDERS", weekShares().daily / weekTotal, s.readiness, "WEEK"), ...dailyRows());
-    parts.push(brkGroup("WEEKLY DRILLS", weekShares().weekly / weekTotal, s.optempo, "WEEK"), ...drillRows());
-    parts.push(brkTotal("WEEK SCORE", s.status, `pace · ${s.earned}% earned`));
+    // WEEK = the average of its days. Drills and ops count in the month.
+    parts.push(brkGroup("DAILY ORDERS", 1, s.readiness, "WEEK"));
+    for (let day = from; day <= to; day = addDays(day, 1)) {
+      const done = activeHabits().filter((h) => h.category === "daily" && isDone(h.id, day)).length;
+      parts.push(brkRow(shortDate(day), dayScore(day) ?? 0, `${done} done`));
+    }
+    parts.push(brkTotal("WEEK SCORE", s.status, `average of its days · ${s.earned}% earned`));
+    parts.push(brkHeading("HABITS THIS WEEK", "days done"), ...dailyRows());
+    parts.push(brkHeading("WEEKLY DRILLS", `${pct(s.optempo)} · scored in the month`), ...drillRows());
     parts.push(brkHeading("MONTHLY OPS THIS WEEK", "scored in the month"), opsLine());
   } else {
-    // MONTH = its weeks + monthly ops.
-    parts.push(brkGroup("WEEKS", monthShares().weeks / monthTotal, s.weeksAvg, "MONTH"));
+    // MONTH = its weeks + weekly drills + monthly ops.
+    parts.push(brkGroup("WEEKS", shares.weeks / monthTotal, s.weeksAvg, "MONTH"));
     for (const w of s.weeks) {
-      const label = `${shortDate(w.from)}–${Number(w.to.slice(8))}`;
+      const label = `${shortDate(w.from)}–${shortDate(w.to)}`;
       parts.push(brkRow(label, round(w.score ?? 0), `${w.days} d`));
     }
-    parts.push(brkGroup("MONTHLY OPS", monthShares().ops / monthTotal, s.missionPct, "MONTH"));
-    parts.push(brkRow("Monthly ops", s.missionPct ?? 0, `${s.missionCount}/${settings.outdoorTarget} · ${s.missionDue.toFixed(1)} due`));
+    parts.push(brkGroup("WEEKLY DRILLS", shares.drills / monthTotal, s.optempo, "MONTH"), ...drillRows());
+    parts.push(brkGroup("MONTHLY OPS", shares.ops / monthTotal, s.missionPct, "MONTH"));
+    for (const line of s.mission.lines) {
+      parts.push(brkRow(line.name, round(line.pct), `${line.count}/${line.target} · ${line.due.toFixed(1)} due`));
+    }
     parts.push(opsLine());
     parts.push(brkTotal("MONTH SCORE", s.status, `pace · ${s.earned}% earned`));
     // Inside the weeks: every habit, to see what moved the score.
-    parts.push(brkHeading("INSIDE THE WEEKS · DAILY ORDERS", pct(s.readiness)), ...dailyRows());
-    parts.push(brkHeading("INSIDE THE WEEKS · WEEKLY DRILLS", pct(s.optempo)), ...drillRows());
+    parts.push(brkHeading("INSIDE THE WEEKS · DAILY ORDERS", "days done"), ...dailyRows());
   }
   return parts;
 }
@@ -3348,7 +3441,7 @@ function renderReview() {
     next.disabled = reviewWeek >= weekStartKey(today);
     document.getElementById("review-q-title").textContent = "// DEBRIEF";
     document.getElementById("review-legend").textContent =
-      `Week score = daily orders ${chainShares().day}% + weekly drills ${chainShares().drills}%. Each daily habit is an equal share of a day; each drill an equal share of the drills, capped at 100%. Monthly ops count in the month.`;
+      `Week score = the average of its days. A day is 0% with nothing done, 50% with your first habit, and climbs in equal steps to 100% with all of them. Weekly drills and monthly ops count in the month.`;
   } else {
     s = monthScores(reviewMonth);
     const range = scoredRange(reviewMonth);
@@ -3356,12 +3449,12 @@ function renderReview() {
     to = range.last;
     unit = "month";
     title.textContent = "After Action Review";
-    sub.textContent = `${OPERATIONS[reviewMonth]} · ${monthLabel(reviewMonth)} · ${monthEnd(reviewMonth) < today ? "CLOSED" : "IN PROGRESS"}`;
+    sub.textContent = `${OPERATIONS[reviewMonth]} · ${monthLabel(reviewMonth)} · ${monthClosed(reviewMonth, today) ? "CLOSED" : "IN PROGRESS"}`;
     prev.disabled = reviewMonth <= MONTHS[0];
-    next.disabled = reviewMonth >= monthOf(today);
+    next.disabled = reviewMonth >= scoreMonthOf(today);
     document.getElementById("review-q-title").textContent = "// AFTER ACTION REVIEW";
     document.getElementById("review-legend").textContent =
-      `Month score = its weeks ${chainShares().weeks}% (averaged by their days) + monthly ops ${chainShares().ops}% (${settings.outdoorTarget} a month, all monthly habits combined; the target grows with the days passed). The year is the average of its months.`;
+      `Month score = its weeks ${chainShares().weeks}% (every Sun–Sat week counts the same; a week belongs to the month with most of its days) + weekly drills ${chainShares().drills}% + monthly ops ${chainShares().ops}% (${opsLines().map((line) => `${line.name} ${line.target}`).join(" + ")} a month, each an equal share; the targets grow with the days passed). The year is the average of its months.`;
   }
 
   document.getElementById("review-questions").replaceChildren(
@@ -3373,10 +3466,10 @@ function renderReview() {
     `<span class="${statusClass(s.status)}">${s.status}%</span>`, `${s.earned}% of ${unit} earned`, false);
   document.getElementById("review-tiles").innerHTML = unit === "week"
     ? scoreTile +
-      tile("READINESS", pct(s.readiness), `daily · ${chainShares().day}%`, s.readiness >= 100) +
-      tile("OPTEMPO", pct(s.optempo), `drills · ${chainShares().drills}%`, s.optempo >= 100)
+      tile("OPTEMPO", pct(s.optempo), "drills · in the month", s.optempo >= 100)
     : scoreTile +
       tile("WEEKS", pct(s.weeksAvg), `weeks · ${chainShares().weeks}%`, s.weeksAvg >= 100) +
+      tile("OPTEMPO", pct(s.optempo), `drills · ${chainShares().drills}%`, s.optempo >= 100) +
       tile("MISSION", pct(s.missionPct), `monthly ops · ${chainShares().ops}%`, s.missionPct >= 100);
   document.getElementById("review-range").textContent = `${shortDate(from)} – ${shortDate(to)}`;
   document.getElementById("review-breakdown").replaceChildren(...breakdown(s, from, to, reviewMode));
@@ -3786,7 +3879,7 @@ function computeStats() {
 
     if (finished) {
       const w = stretchScore(range.first, range.last);
-      if (w.score !== null && w.score >= 99.95) perfectWeeks += 1;
+      if (w.daily !== null && w.daily >= 99.95 && (w.weekly === null || w.weekly >= 99.95)) perfectWeeks += 1;
       drillRun = w.weekly !== null && w.weekly >= 99.95 ? drillRun + 1 : 0;
       bestDrillRun = Math.max(bestDrillRun, drillRun);
     }
@@ -3818,13 +3911,15 @@ function computeStats() {
   for (const month of MONTHS) {
     const s = monthScores(month);
     if (!s) break;   // this month and the rest haven't started
-    const finished = monthEnd(month) < today;
+    const finished = monthClosed(month, today);   // its last week has ended
     const first = month + "-01" < TRACK_START ? TRACK_START : month + "-01";
-    const opsLeft = finished ? 0 : (daysBetween(today, monthEnd(month)) - 1) * outdoor.length;
-    monthOk[month] = outdoor.length === 0 || s.missionCount + opsLeft >= settings.outdoorTarget;
+    // Every monthly ops line must be met, or still reachable (one check-off
+    // a day per habit in the line).
+    const daysLeft = monthEnd(month) < today ? 0 : daysBetween(today, monthEnd(month)) - 1;   // ops: calendar days
+    monthOk[month] = s.mission.lines.every((line) => line.count + daysLeft * line.ids.length >= line.target);
 
     if (finished && s.statusRaw >= 99.95) perfectMonths += 1;
-    if (s.missionCount >= settings.outdoorTarget) objectives += 1;
+    if (s.mission.met) objectives += 1;
     if (finished) {
       const hit90 = reaches(s.statusRaw, 90);
       if (hit90) months90 += 1;
@@ -3904,7 +3999,8 @@ function computeStats() {
   const todayPct = daily.length ? (countOn(daily, today) / daily.length) * 100 : 0;
   let asOf = todayPct > 70 ? today : addDays(today, -1);
   if (asOf > MONTHS[MONTHS.length - 1] + "-31") asOf = monthEnd(MONTHS[MONTHS.length - 1]);
-  const statusRaw = MONTHS.includes(monthOf(asOf)) ? monthScores(monthOf(asOf), asOf)?.statusRaw ?? null : null;
+  const statusMonth = scoreMonthOf(asOf);   // the month today's week counts in
+  const statusRaw = MONTHS.includes(statusMonth) ? monthScores(statusMonth, asOf)?.statusRaw ?? null : null;
 
   return {
     totalLogs: logs.length,
@@ -4373,7 +4469,8 @@ function renderRankPanel() {
 
 // ---------- DAILY ORDERS panel: your habits ----------
 // Frequency on screen → category in the data. "Monthly" habits are the
-// monthly ops (category "outdoor"), counted together toward one target.
+// monthly ops (category "outdoor"): they share the field ops target, unless
+// they have their own (ownTarget, the /MO box).
 const FREQUENCIES = [["daily", "DAILY"], ["weekly", "WEEKLY"], ["outdoor", "MONTHLY"]];
 const FREQ_TITLES = { daily: "// DAILY", weekly: "// WEEKLY", outdoor: "// MONTHLY OPS" };
 
@@ -4430,6 +4527,14 @@ function renderHabitEditor() {
         line2.append(
           numberInput(habit.target || 1, 1, 7, `${habit.name} per week`, (n) => updateHabit(habit.id, { target: n })),
           el("span", "per", "/WK")
+        );
+      }
+      // Monthly habits: 0 = shares the field ops pool, 1+ = its own line.
+      if (habit.category === "outdoor") {
+        line2.append(
+          numberInput(habit.ownTarget || 0, 0, 31, `${habit.name} own monthly target`,
+            (n) => updateHabit(habit.id, { ownTarget: n || undefined })),
+          el("span", "per", "/MO")
         );
       }
       line2.append(smallButton(retired ? "RESTORE" : "RETIRE", `${retired ? "Restore" : "Retire"} ${habit.name}`,
@@ -4496,12 +4601,12 @@ function renderGoalEditor() {
 
   const c = chainShares();
   document.getElementById("goal-editor").replaceChildren(
-    field("Monthly ops per month", numberInput(settings.outdoorTarget, 1, 60, "Monthly ops per month",
+    field("Field ops per month", numberInput(settings.outdoorTarget, 1, 60, "Field ops per month",
       (n) => { settings.outdoorTarget = n; commitSettings(); })),
-    el("div", "note pad", "Every monthly habit counts toward this one combined target."),
+    el("div", "note pad", "Monthly habits with /MO set to 0 share this target. One with its own /MO (like Celebrate Recovery, 4) is its own line. Each line is an equal share of monthly ops."),
     ...weightRows,
     message,
-    el("div", "note pad", `So a week = days ${c.day}% + drills ${c.drills}%, and a month = weeks ${c.weeks}% + monthly ops ${c.ops}%.`)
+    el("div", "note pad", `So a month = weeks ${c.weeks}% + drills ${c.drills}% + monthly ops ${c.ops}%. A week is the average of its days.`)
   );
   const w = settings.weights;
   document.getElementById("sum-goals").textContent =
@@ -4999,7 +5104,7 @@ function restoreBackup(data) {
   logs = data.logs;
   reviews = data.reviews || {};
   awards = data.awards || {};
-  settings = mergeSettings(data.settings);
+  settings = splitCR(mergeSettings(data.settings));   // an older backup gets the CR split too
   saveLogs();
   saveReviews();
   saveAwards();
