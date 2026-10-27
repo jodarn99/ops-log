@@ -2437,9 +2437,12 @@ function drillScore(from, to, share) {
 
 // DAILY PART for a stretch: the average of its days' scores (dayRaw).
 function dailyAvg(from, to) {
-  if (activeHabits().every((h) => h.category !== "daily")) return null;
+  const ids = activeHabits().filter((h) => h.category === "daily").map((h) => h.id);
+  if (ids.length === 0) return null;
   let sum = 0;
-  for (let day = from; day <= to; day = addDays(day, 1)) sum += dayRaw(day);
+  for (let day = from; day <= to; day = addDays(day, 1)) {
+    sum += dayFromCount(ids.filter((id) => isDone(id, day)).length, ids.length);
+  }
   return sum / daysBetween(from, to);
 }
 
@@ -2810,8 +2813,20 @@ function round(n) {
 const MONTHS = Object.keys(OPERATIONS);
 
 // The last day of the campaign (Dec 31, 2027).
-function campaignEnd() {
-  return monthEnd(MONTHS[MONTHS.length - 1]);
+const CAMPAIGN_END = monthEnd(MONTHS[MONTHS.length - 1]);
+
+// The month a day's SCORE goes to: the month its week belongs to (the one
+// holding that week's Wednesday). Nov 30, 2026 -> "2026-12"; Jan 1, 2027
+// -> "2026-12" (its week, Dec 27 – Jan 2, is December's last).
+function scoreMonthOf(day) {
+  return monthOf(addDays(weekStartKey(day), 3));
+}
+
+// A month is CLOSED once its last week has ended (up to 3 days past the
+// calendar month), so its score can't change any more.
+function monthClosed(month, today = todayKey()) {
+  const weeks = monthWeeks(month);
+  return (weeks.length ? weeks[weeks.length - 1].end : monthEnd(month)) < today;
 }
 
 // A month's WEEKS: every Sun–Sat week whose Wednesday is in the month, so
@@ -2824,7 +2839,8 @@ function monthWeeks(month) {
   for (let ws = weekStartKey(month + "-01"); ws <= monthEnd(month); ws = addDays(ws, 7)) {
     if (monthOf(addDays(ws, 3)) !== month) continue;         // its Wednesday is in another month
     const first = ws < TRACK_START ? TRACK_START : ws;
-    const end = addDays(ws, 6) > campaignEnd() ? campaignEnd() : addDays(ws, 6);
+    const we = addDays(ws, 6);
+    const end = we > CAMPAIGN_END ? CAMPAIGN_END : we;
     if (first <= end) weeks.push({ start: ws, first, end });
   }
   return weeks;
@@ -2888,9 +2904,9 @@ function monthScores(month, asOf = todayKey()) {
   const earnedRaw = statusRaw * (days / monthDays);
 
   return {
-    weeks, days, monthDays, first: range.first, last: range.last,
+    weeks, days, monthDays, first: range.first, last: range.last, calFirst, calLast,
     status: round(statusRaw), statusRaw, earned: round(earnedRaw), earnedRaw,
-    weeksAvg: round(weeksAvg), readiness: round(weeksAvg), optempo: round(optempo),
+    weeksAvg: round(weeksAvg), optempo: round(optempo),
     mission, missionCount: mission.count, missionDue: mission.due, missionPct: round(ops), monthlyPct: round(ops),
   };
 }
@@ -3001,7 +3017,7 @@ function yearBar(year) {
 let hqShowAll = false;
 
 function renderHq() {
-  const current = monthOf(todayKey());
+  const current = scoreMonthOf(todayKey());   // the month today's week counts in
   const rows = [];
   // Before Oct 11 or after Dec 2027 there's no current month: show them all.
   const focus = !hqShowAll && MONTHS.includes(current);
@@ -3120,7 +3136,7 @@ function saveReviews() {
 let reviews = loadReviews();
 let reviewMode = "debrief";                    // "debrief" or "aar"
 let reviewWeek = weekStartKey(todayKey());     // the Sunday of the week on screen
-let reviewMonth = monthOf(todayKey());         // the month on screen
+let reviewMonth = scoreMonthOf(todayKey());    // the month on screen (today's week's month)
 
 function reviewKey() {
   return reviewMode === "debrief" ? `week:${reviewWeek}` : `month:${reviewMonth}`;
@@ -3137,7 +3153,8 @@ function isFiled(key) {
 // ---------------------------------------------------------------------
 // The days of a week that count: never before Oct 11, never after today.
 function weekRange(weekStart) {
-  const end = addDays(weekStart, 6) > campaignEnd() ? campaignEnd() : addDays(weekStart, 6);
+  const we = addDays(weekStart, 6);
+  const end = we > CAMPAIGN_END ? CAMPAIGN_END : we;
   const today = todayKey();
   const first = weekStart < TRACK_START ? TRACK_START : weekStart;
   const last = end < today ? end : today;
@@ -3172,8 +3189,9 @@ function weekScores(weekStart) {
   // Monthly ops logged this week: shown for reference, scored in the month.
   const outdoorIds = activeHabits().filter((h) => h.category === "outdoor").map((h) => h.id);
   const missionCount = countBetween(outdoorIds, range.first, range.last);
-  // EARNED: share of the WHOLE week banked so far (score × days/7).
-  const earnedRaw = (w.score ?? 0) * (w.days / 7);
+  // EARNED: share of the WHOLE week banked so far (score × days so far ÷
+  // days in the week; 7, except the campaign's last week, which is 6).
+  const earnedRaw = (w.score ?? 0) * (w.days / daysBetween(range.first, range.end));
   return {
     ...range, days: w.days,
     status: round(w.score ?? 0), statusRaw: w.score ?? 0, earned: round(earnedRaw),
@@ -3241,9 +3259,13 @@ function breakdown(s, from, to, mode) {
     return brkRow(h.short || h.name, Math.round(drillPct(h, from, to)), detail);
   });
   // What went into the monthly ops pool.
+  // In an AAR, monthly ops count over the calendar month so far, the same
+  // days as MISSION (before the 1st, nothing yet).
+  const opsCount = (id) => mode === "debrief" ? countBetween([id], from, to)
+    : s.calFirst <= s.calLast ? countBetween([id], s.calFirst, s.calLast) : 0;
   const opsLine = () => {
     const ops = activeHabits().filter((h) => h.category === "outdoor")
-      .map((h) => `${h.short || h.name} ${countBetween([h.id], from, to)}`);
+      .map((h) => `${h.short || h.name} ${opsCount(h.id)}`);
     const line = el("div", "note", ops.join(" · "));
     line.style.padding = "6px 12px";
     return line;
@@ -3427,9 +3449,9 @@ function renderReview() {
     to = range.last;
     unit = "month";
     title.textContent = "After Action Review";
-    sub.textContent = `${OPERATIONS[reviewMonth]} · ${monthLabel(reviewMonth)} · ${monthEnd(reviewMonth) < today ? "CLOSED" : "IN PROGRESS"}`;
+    sub.textContent = `${OPERATIONS[reviewMonth]} · ${monthLabel(reviewMonth)} · ${monthClosed(reviewMonth, today) ? "CLOSED" : "IN PROGRESS"}`;
     prev.disabled = reviewMonth <= MONTHS[0];
-    next.disabled = reviewMonth >= monthOf(today);
+    next.disabled = reviewMonth >= scoreMonthOf(today);
     document.getElementById("review-q-title").textContent = "// AFTER ACTION REVIEW";
     document.getElementById("review-legend").textContent =
       `Month score = its weeks ${chainShares().weeks}% (every Sun–Sat week counts the same; a week belongs to the month with most of its days) + weekly drills ${chainShares().drills}% + monthly ops ${chainShares().ops}% (${opsLines().map((line) => `${line.name} ${line.target}`).join(" + ")} a month, each an equal share; the targets grow with the days passed). The year is the average of its months.`;
@@ -3889,11 +3911,11 @@ function computeStats() {
   for (const month of MONTHS) {
     const s = monthScores(month);
     if (!s) break;   // this month and the rest haven't started
-    const finished = monthEnd(month) < today;
+    const finished = monthClosed(month, today);   // its last week has ended
     const first = month + "-01" < TRACK_START ? TRACK_START : month + "-01";
     // Every monthly ops line must be met, or still reachable (one check-off
     // a day per habit in the line).
-    const daysLeft = finished ? 0 : daysBetween(today, monthEnd(month)) - 1;
+    const daysLeft = monthEnd(month) < today ? 0 : daysBetween(today, monthEnd(month)) - 1;   // ops: calendar days
     monthOk[month] = s.mission.lines.every((line) => line.count + daysLeft * line.ids.length >= line.target);
 
     if (finished && s.statusRaw >= 99.95) perfectMonths += 1;
@@ -3977,7 +3999,8 @@ function computeStats() {
   const todayPct = daily.length ? (countOn(daily, today) / daily.length) * 100 : 0;
   let asOf = todayPct > 70 ? today : addDays(today, -1);
   if (asOf > MONTHS[MONTHS.length - 1] + "-31") asOf = monthEnd(MONTHS[MONTHS.length - 1]);
-  const statusRaw = MONTHS.includes(monthOf(asOf)) ? monthScores(monthOf(asOf), asOf)?.statusRaw ?? null : null;
+  const statusMonth = scoreMonthOf(asOf);   // the month today's week counts in
+  const statusRaw = MONTHS.includes(statusMonth) ? monthScores(statusMonth, asOf)?.statusRaw ?? null : null;
 
   return {
     totalLogs: logs.length,
